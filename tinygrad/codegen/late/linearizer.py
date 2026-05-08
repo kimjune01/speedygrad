@@ -8,29 +8,38 @@ def linearize(sink:UOp) -> list[UOp]:
   # this is a toposort with priority
   lst = list(sink.toposort())
   out_degree:defaultdict[UOp, int] = defaultdict(int)
+  consumers:defaultdict[UOp, list[UOp]] = defaultdict(list)
   priorities:dict[UOp, tuple[int, int, Any]] = {}
+
+  # build consumer map and out degrees
+  for u in lst:
+    for s in u.src:
+      out_degree[s] += 1
+      consumers[s].append(u)
+
+  # CPL: critical path length from each node to any sink, weighted by latency
+  load_lat = getenv("CPL_LOAD_LAT", 10)
+  cpl:dict[UOp, int] = {}
+  for u in reversed(lst):
+    lat = load_lat if u.op is Ops.LOAD else 1
+    cpl[u] = lat + max([cpl[v] for v in consumers[u]], default=0)
 
   # get consumers and assign priorities
   # NOTE: this requires the lst be locally toposorted
   for u in reversed(lst):
-    for s in u.src: out_degree[s] += 1
-
     # we place UOps with higher run_counts later
     run_count = prod([int(r.vmax)+1 for r in u.ranges])
 
-    # simple priority override. this is all bottom up now, smaller numbers will be closer to the top
+    # structural ops get fixed priorities far from CPL range; computation ops get CPL priority (smaller = earlier)
     extra = None
     match u.op:
-      # the order and placement of these defines is important
-      case Ops.PARAM: priority, extra = -20, u.arg
-      case Ops.DEFINE_VAR: priority, extra = -19, u.arg
-      case Ops.DEFINE_LOCAL: priority = -18
-      case Ops.DEFINE_REG: priority = -17
-      case Ops.LOAD: priority = -1    # place loads early
-      case Ops.STORE: priority = 1    # place stores late
-      case Ops.RANGE: priority = 5    # placing RANGE is good
-      case Ops.END: priority = -5     # placing END is bad
-      case _: priority = 0            # everything else has priority 0
+      case Ops.PARAM: priority, extra = -10000, u.arg
+      case Ops.DEFINE_VAR: priority, extra = -9000, u.arg
+      case Ops.DEFINE_LOCAL: priority = -8000
+      case Ops.DEFINE_REG: priority = -7000
+      case Ops.RANGE: priority = 10000
+      case Ops.END: priority = -5000
+      case _: priority = -cpl[u]
     priorities[u] = (run_count, priority, extra)
 
   # number the uops in "ideal" order
