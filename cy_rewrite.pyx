@@ -62,7 +62,7 @@ def cy_unified_rewrite(self, root):
     pm = self.pm
     bpm = self.bpm
     ctx = self.ctx
-    cdef dict bpm_cache = self._bpm_cache if bpm is not None else {}
+    cdef dict bpm_cache = self.bpm_cache
 
     while stack:
         if len(stack) > 250000:
@@ -80,14 +80,19 @@ def cy_unified_rewrite(self, root):
                         raise RuntimeError("infinite loop in fixed_point_rewrite")
                     seen.add(test_n)
                     new_n = test_n
-                    try:
-                        test_n = self.cached_bpm_rewrite(test_n)
-                    except BottomUpGate:
-                        replace[n] = unwrap(test_n)
-                        if n in waitlist:
-                            stack.extend(waitlist.pop(n))
-                        gate = True
-                        break
+                    _bpm_ret = bpm_cache.get(test_n, SENTINEL)
+                    if _bpm_ret is not SENTINEL:
+                        test_n = _bpm_ret
+                    else:
+                        try:
+                            test_n = bpm.rewrite(test_n, ctx)
+                        except BottomUpGate:
+                            replace[n] = unwrap(test_n)
+                            if n in waitlist:
+                                stack.extend(waitlist.pop(n))
+                            gate = True
+                            break
+                        bpm_cache[new_n] = test_n
                 if gate:
                     continue
             stack.append((n, 1, new_n))
