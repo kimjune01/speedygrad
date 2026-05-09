@@ -235,7 +235,7 @@ Not shippable to tinygrad (Python-only project). **Shipped in speedygrad** as `c
 | backward_slice O(n²) | Double caching makes it structurally impossible | Still dead |
 | Bloom filter gate | Cascade failure — 98% skip rate but 2% misses break correctness | Still dead |
 | Decision tree | Python per-call overhead neutralizes iteration savings | **REOPENED** — native branches in Cython |
-| Huffman if-elif tree | CPython `dict.get` is O(1), if-elif is O(n) in bytecode interpreter | **REOPENED** — Cython if-elif compiles to native branches with branch prediction |
+| Huffman if-elif tree | CPython `dict.get` is O(1), if-elif is O(n) in bytecode interpreter | **RE-KILLED** — bitmask subsumes: 93% skip rate → ordering irrelevant, 4.5ms max savings |
 | Per-op compiled functions | Frame creation (~100-150ns) exceeds loop elimination savings | **REOPENED** — no frame creation in Cython |
 | Nested pdict (op → src[0].op) | 73% wildcard fallback, 2 dict.gets for same result | Still dead (structural) |
 | Bitmask early-reject | `frozenset.issubset` is already a C builtin | **REOPENED** — integer AND (1ns) vs frozenset.issubset (56ns/call, 1.32M calls = 74ms) |
