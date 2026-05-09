@@ -41,5 +41,12 @@ class TestLinearizerRewrite(unittest.TestCase):
     prg = to_program(ast.replace(arg=KernelInfo(name="custom")), Device["CPU"].renderer)
     self.assertEqual(prg.arg.name, "custom")
 
+class TestPTXBfloat16(unittest.TestCase):
+  def test_bf16_rejected_when_cuda_renderer_unresolved(self):
+    from tinygrad.device import is_dtype_supported
+    from tinygrad.dtype import dtypes
+    from tinygrad.helpers import Target
+    assert not is_dtype_supported(dtypes.bfloat16, Target('CUDA', '', 'sm_89'))
+
 if __name__ == '__main__':
   unittest.main()
