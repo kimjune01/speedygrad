@@ -145,6 +145,53 @@ Cold schedule time improvement. The compiled matcher already runs inside `pdict[
 
 ---
 
+## Cython floor-lowering chain (2026-05-09)
+
+ResNet50 schedule + rewrite (20 kernels). Metal, Python 3.14. `import monkeypatch` for Cython.
+
+| Stage | Time | LOC | `rewrite` ms | vs Python |
+|---|---|---|---|---|
+| Pure Python | 3.457s | 0 | — | baseline |
+| + Cython unified_rewrite | 2.282s | 95 .pyx | 341 | -34% |
+| + bitmask early-reject | 2.216s | +8 .py | 307 | -36% |
+| + int(op) descriptor fix | 2.145s | +3 .py | 283 | -38% |
+| + list-indexed dispatch | 2.042s | +2 .py | 229 | -41% |
+| + skip mega guard | 1.979s | +1 .py | 202 | -43% |
+| + Cython rewrite + inline pm | 1.817s | +50 .pyx | (in C) | -47% |
+| + Sou-ly dfs_match (#15491) | 1.752s | +30 .py | (in C) | -49% |
+
+Pattern match frequency: 6.7% hit rate, 80% median winner concentration per op. 93.3% of attempts are wasted. Huffman ordering (under Cython native branches) is the next layer.
+
+Attribution: Sou-ly (github.com/Sou-ly) for dfs_match, recursive_property fast path, op_in_backward_slice_with_self, fix_store_after_hazard DFS. From tinygrad PR #15491, closed as "AI SLOP."
+
+---
+
+## Warp-reduce activation (2026-05-09)
+
+GROUPTOP 16→32 in heuristic.py + relaxed `fix_group_for_reduce_warp` to accept REDUCEs with additional reduce ranges.
+
+### Metal (softmax 1024x1024, fp32)
+
+| Kernel | Shared mem (GROUPTOP=16) | Warp-reduce (GROUPTOP=32) | Speedup |
+|---|---|---|---|
+| max reduction | 94.13us | 26.88us | **3.50x** |
+| sum reduction | 25.75us | 25.25us | ~neutral |
+
+Max 3.5x faster: eliminates shared memory writes, `threadgroup_barrier`, serialized 16-iteration final loop (thread 0 active, 15 idle). Sum neutral — `exp2` computation dominates.
+
+---
+
+## CPL scheduling — KILLED on Metal (2026-05-09)
+
+10-line CPL priority in linearizer. Two findings:
+
+1. **Matvec:** identical kernel source (topological constraints too tight after stride-aware fix)
+2. **GEMM TC:** different kernel source (interleaved loads/WMMAs vs batched), same GPU time (~870-900us)
+
+Kill condition: Metal's shader compiler normalizes instruction order. Source-level scheduling is advisory.
+
+---
+
 ## Windows CUDA setup notes
 
 From the RTX 5000 Ada bench session:
