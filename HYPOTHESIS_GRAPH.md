@@ -211,11 +211,11 @@ Merging all 20 ADD patterns into one function eliminates 19 frame creations (~10
 
 But no end-to-end signal: 66% of rewrite calls have 0-1 patterns (mega doesn't apply), 24% have 5+ patterns (mega helps but only ~200ns/call savings). Expected improvement: 24% x 15% x 68% = 2.4% of total, ~0.5ms on 23ms — below measurement variance.
 
-### Cython transpile of unified_rewrite (H27) — CONFIRMED (-7.3% e2e)
+### Cython transpile of unified_rewrite (H27) — CONFIRMED, SHIPPED in speedygrad
 
-First end-to-end signal in the entire investigation. Transpiled `unified_rewrite` to C via Cython (95 lines, zero algorithmic changes). 22.98ms → 21.30ms.
+First end-to-end signal in the entire investigation. Transpiled `unified_rewrite` to C via Cython (95 lines, zero algorithmic changes). 22.98ms → 21.30ms (-7.3%).
 
-7.3% of tinygrad's compilation cost is pure CPython bytecode dispatch overhead in one function. Not shippable to tinygrad (Python-only project). Quantifies the CPython JIT opportunity.
+Not shippable to tinygrad (Python-only project). **Shipped in speedygrad** as `cy_rewrite.pyx` + `monkeypatch.py`. Build: `python setup_cy.py build_ext --inplace`. Use: `import monkeypatch`. Confirmed -8.2% on warm matmul (7.3ms → 6.7ms, M4 Max, Python 3.14).
 
 ### Killed hypotheses
 
@@ -325,6 +325,7 @@ No dead code in top 10 files (exhaustive grep). Renderer prefix dedup: only 4-5 
 
 ### Infrastructure
 11. CPython JIT for branchy dict/deque loops (contribution to CPython, not tinygrad)
+12. Extend Cython coverage beyond `unified_rewrite` — typed annotations on UOp fields would widen the gap to 15-20%
 
 ---
 
@@ -366,7 +367,7 @@ Performance gap (1.2-5.9x vs torch) — CONFIRMED
 ├─ Pattern matcher — CONFIRMED (CPython overhead)
 │   ├─ redundant root op check (-3.2 to -4.0%) — CONFIRMED
 │   ├─ mega-matcher (-18% micro, 0% e2e) — CONFIRMED
-│   ├─ Cython transpile (-7.3% e2e) — CONFIRMED (not shippable)
+│   ├─ Cython transpile (-7.3% e2e) — CONFIRMED, SHIPPED
 │   └─ CPython JIT improvement — OPEN
 │
 ├─ Warp-reduce for GROUPTOP (2.1-4.2x) — CONFIRMED
