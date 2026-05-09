@@ -50,6 +50,35 @@ Semantic theories ("UPCAST N, UNROLL K, UPCAST M, LOCAL M — each by largest di
 
 52-trial measurement loop (TC, UPCAST per axis, LOCAL per axis, GROUP, GROUPTOP, UNROLL, stride-based axis ordering) achieves 1.85x geometric mean over the heuristic on 5 workloads. Sole remaining gap: matvec (1.10x), where the heuristic's joint GROUP+LOCAL+UPCAST combo beats greedy search.
 
+### Stride-aware matvec
+
+MV_ROWS_PER_THREAD=4 leaves most of each cache line unused. Increasing to 16 improves bandwidth utilization 62-105% on Metal. No regressions across LLaMA, GPT-2, BERT, Whisper, Mixtral.
+
+| Layout | Before | After |
+|---|---|---|
+| contiguous (K,N) | 53 GB/s | 86 GB/s |
+| transposed (N,K).T | 43 GB/s | 87 GB/s |
+
+*PR: #16072*
+
+### Warp-reduce for GROUPTOP
+
+Replace scalar shared-memory reduction loop with simd_sum. 2.1-4.2x faster on the reduction step. HIP disabled until tested on AMD hardware.
+
+*PR: #16070*
+
+### Compiled UPat matcher: skip redundant root op check
+
+The compiled matcher already runs inside `pdict[uop.op]` dispatch — the root op check is redundant. Removing it speeds up cold schedule time 9-15% across softmax, conv, transformer workloads.
+
+*PR: #16096*
+
+### Contiguous weights + rollout prune for quantized GGUF
+
+Quantized GGUF weights are lazy dequant chains that fuse into matmul kernels. Making weights contiguous breaks the fusion; prune makes the dequant one-time during JIT capture. 14x on Metal, 8.2x on NV for LLaMA 1B Q6_K.
+
+*PR: #16094*
+
 ### PTX/CUDA renderer fallback
 
 `is_dtype_supported` checks against the base renderer class, not the resolved renderer. PTXRenderer silently replaces CUDARenderer when NVRTC is missing, producing different (slower) kernels without warning.
@@ -93,5 +122,9 @@ H0 (heuristics are improvable) — CONFIRMED
  │   └─ non-matmul transfer — OPEN
  ├─ abduction loop (52 trials, 1.85x geo mean) — CONFIRMED
  │   └─ joint optimization for matvec — OPEN
+ ├─ stride-aware matvec (62-105% BW gain) — CONFIRMED
+ ├─ warp-reduce for GROUPTOP (2.1-4.2x) — CONFIRMED
+ ├─ UPat matcher root op skip (9-15% cold schedule) — CONFIRMED
+ ├─ GGUF contiguous + prune (14x Metal, 8.2x NV) — CONFIRMED
  └─ renderer fallback detection — CONFIRMED
 ```
