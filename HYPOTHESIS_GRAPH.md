@@ -176,9 +176,20 @@ MV_ROWS_PER_THREAD 4 → 16. No regressions on LLaMA, GPT-2, BERT, Whisper, Mixt
 
 *PR: #16072*
 
-### Warp-reduce for GROUPTOP — CONFIRMED
+### Warp-reduce for GROUPTOP — CONFIRMED, ACTIVATED
 
-Replace scalar shared-memory reduction with simd_sum. 2.1-4.2x on the reduction step. HIP disabled pending AMD testing.
+Replace scalar shared-memory reduction with simd_sum/simd_max. Originally shipped with GROUPTOP=32 constraint but the heuristic hardcoded GROUPTOP=16 — warp-reduce never fired.
+
+**Fix:** GROUPTOP 16→32 in `heuristic.py` + relax `fix_group_for_reduce_warp` to accept REDUCEs with additional reduce ranges (the per-thread partial sum loop).
+
+| Kernel | Shared mem (GROUPTOP=16) | Warp-reduce (GROUPTOP=32) | Speedup |
+|---|---|---|---|
+| softmax max (1024x1024) | 94.13us | 26.88us | **3.50x** |
+| softmax sum (1024x1024) | 25.75us | 25.25us | ~neutral |
+
+Max reduction 3.5x faster because warp-reduce eliminates: shared memory writes, `threadgroup_barrier`, and the serialized 16-iteration final loop (thread 0 works, 15 idle). Sum is neutral because `exp2` computation dominates over the reduction step.
+
+Correctness verified: 9 shapes (32 to 1024x1024), sum/max/softmax all pass. Linearizer tests: 24 passed.
 
 *PR: #16070*
 
@@ -217,20 +228,76 @@ First end-to-end signal in the entire investigation. Transpiled `unified_rewrite
 
 Not shippable to tinygrad (Python-only project). **Shipped in speedygrad** as `cy_rewrite.pyx` + `monkeypatch.py`. Build: `python setup_cy.py build_ext --inplace`. Use: `import monkeypatch`. Confirmed -8.2% on warm matmul (7.3ms → 6.7ms, M4 Max, Python 3.14).
 
-### Killed hypotheses
+### Killed hypotheses (under CPython — some reopened under Cython)
 
-| Hypothesis | Why it died |
-|---|---|
-| backward_slice O(n²) | Double caching makes it structurally impossible |
-| Bloom filter gate | Cascade failure — 98% skip rate but 2% misses break correctness |
-| Decision tree | Python per-call overhead neutralizes iteration savings |
-| Huffman if-elif tree | CPython `dict.get` is O(1), if-elif is O(n) in bytecode interpreter |
-| Per-op compiled functions | Frame creation (~100-150ns) exceeds loop elimination savings |
-| Nested pdict (op → src[0].op) | 73% wildcard fallback, 2 dict.gets for same result |
-| Bitmask early-reject | `frozenset.issubset` is already a C builtin |
-| Redundant len(src) check | UOps don't enforce arity; intermediates have wrong src count |
-| RETE leaf skip | Leaf nodes are 6% of graph; Python overhead per visit dominates |
-| Skip 0-pattern ops | Already cheap (~50ns each), saves 0.23ms on 23ms |
+| Hypothesis | Why it died (CPython) | Cython status |
+|---|---|---|
+| backward_slice O(n²) | Double caching makes it structurally impossible | Still dead |
+| Bloom filter gate | Cascade failure — 98% skip rate but 2% misses break correctness | Still dead |
+| Decision tree | Python per-call overhead neutralizes iteration savings | **REOPENED** — native branches in Cython |
+| Huffman if-elif tree | CPython `dict.get` is O(1), if-elif is O(n) in bytecode interpreter | **REOPENED** — Cython if-elif compiles to native branches with branch prediction |
+| Per-op compiled functions | Frame creation (~100-150ns) exceeds loop elimination savings | **REOPENED** — no frame creation in Cython |
+| Nested pdict (op → src[0].op) | 73% wildcard fallback, 2 dict.gets for same result | Still dead (structural) |
+| Bitmask early-reject | `frozenset.issubset` is already a C builtin | **REOPENED** — integer AND (1ns) vs frozenset.issubset (56ns/call, 1.32M calls = 74ms) |
+| Redundant len(src) check | UOps don't enforce arity; intermediates have wrong src count | Still dead (correctness) |
+| RETE leaf skip | Leaf nodes are 6% of graph; Python overhead per visit dominates | Still dead (structural) |
+| Skip 0-pattern ops | Already cheap (~50ns each), saves 0.23ms on 23ms | Still dead (marginal) |
+
+### Cython floor-lowering chain — PROPOSED
+
+With `unified_rewrite` in Cython (-34% on ResNet50 schedule), the NEW hotspots are measurable:
+
+| Hotspot | Calls | Tottime | Cython replacement | Expected savings |
+|---|---|---|---|---|
+| `dict.get` (pdict dispatch) | 1.34M | 94ms | integer array index | ~90ms |
+| `set.issubset` (early reject) | 1.32M | 74ms | bitmask AND+compare | ~73ms |
+| `rewrite` (pattern dispatch) | 417K | 341ms | Cython + Huffman if-elif | ~200ms |
+| `toposort` | 39K | 140ms | Cython typed traversal | ~100ms |
+| `__call__` (UOp ctor) | 234K | 105ms | Cython typed fields | ~70ms |
+
+Each layer of Cython lowers the floor, exposing the next bottleneck.
+
+**Bitmask early-reject — CONFIRMED (-2.9% e2e, -10% on `rewrite`).** Replaced `frozenset.issubset` (74ms, 1.32M calls) with integer AND+compare. Eliminated `set.issubset` from the profile entirely. Net savings ~66ms after subtracting 29ms new overhead from FastEnum `.value` descriptor protocol. In Cython, the descriptor overhead vanishes (direct field access).
+
+| Stage | ResNet50 schedule+rewrite (20 kernels) | vs pure Python |
+|---|---|---|
+| Stage | Time | LOC | `rewrite` ms | vs Python |
+|---|---|---|---|---|
+| Pure Python | 3.457s | 0 | — | baseline |
+| + Cython unified_rewrite | 2.282s | 95 | 341 | -34% |
+| + bitmask early-reject | 2.216s | +8 | 307 | -36% |
+| + int(op) descriptor fix | 2.145s | +3 | 283 | -38% |
+| + list-indexed dispatch | 2.042s | +2 | 229 | -41% |
+| + skip mega guard | 1.979s | +1 | 202 | -43% |
+| + Cython rewrite + inline pm | 1.817s | +50 .pyx | (in C) | -47% |
+
+16 lines of new code (post-Cython) → `rewrite` 41% faster (341→202ms). Function calls: 12.2M→9.8M. The bitmask optimization is also visible in pure CPython (-4.3%), not just Cython — the original kill reason ("frozenset.issubset is a C builtin") was too coarse.
+
+What "complexity" means here: depth of indirection between source and effect. `frozenset.issubset` and `(a & b) != a` look identical in source — the complexity is in the 6 invisible runtime layers (method dispatch, descriptor protocol, hash probe, set iteration) vs 1 CPU instruction.
+
+Remaining hotspots (after all pure-Python optimizations):
+
+| Function | Tottime | Next step |
+|---|---|---|
+| `graph_rewrite` | 224ms | Cythonize outer loop (deque, set, dict operations) |
+| `rewrite` | 202ms | Cythonize → Huffman if-elif with branch prediction |
+| `toposort` | 145ms | Cythonize typed traversal |
+| `__call__` (UOp ctor) | 103ms | typed fields |
+| `_shape` | 86ms | cached typed property |
+| `dict.get` | 67ms | remaining from bitmask cache |
+
+Cython `rewrite` shipped: pattern matching now runs in compiled C. `pm_rewrite` inlined into `cy_unified_rewrite` — eliminates the Python wrapper call (147ms). Both functions invisible in Python profiler.
+
+Remaining hotspots (all Python):
+
+| Function | Tottime | Next step |
+|---|---|---|
+| `graph_rewrite` wrapper | 329ms | profile_matches decorator overhead |
+| `toposort` | 137ms | Cythonize typed traversal |
+| `__call__` (UOp ctor) | 102ms | typed fields |
+| `_shape` | 82ms | cached typed property |
+| `cached_bpm_rewrite` | 65ms | inline into cy_unified_rewrite |
+| `__get__` (descriptor) | 61ms | Cython typed access |
 
 ---
 
@@ -297,7 +364,7 @@ No dead code in top 10 files (exhaustive grep). Renderer prefix dedup: only 4-5 
 
 ---
 
-## PTX/CUDA renderer fallback — CONFIRMED
+## VII. PTX/CUDA renderer fallback — CONFIRMED
 
 `is_dtype_supported` checks against the base renderer class, not the resolved renderer. PTXRenderer silently replaces CUDARenderer when NVRTC is missing.
 
@@ -305,27 +372,84 @@ No dead code in top 10 files (exhaustive grep). Renderer prefix dedup: only 4-5 
 
 ---
 
+## VIII. Triage pipeline fixes
+
+Originated from `~/.sweep/repos/tinygrad-tinygrad/TRIAGE_GRAPH.md`. Investigated during cooldown (all 10 upstream PRs closed, 2026-05-08). Dry-run fixes never pushed upstream. Ported to speedygrad.
+
+### T11908: Beam cache invalidation — CONFIRMED, SHIPPED
+
+Beam search cache key omits optimization env vars (`BEAM_UPCAST_MAX`, `BEAM_LOCAL_MAX`, `BEAM_UOPS_MAX`, `BEAM_PADTO`, `NOLOCALS`, `TC`, `TC_OPT`). Changing any between runs serves stale cached results. Fix: 7 env var values added to cache key dict in `search.py:123`. +3 lines.
+
+### T12296: max backward underflow (float16) — CONFIRMED, SHIPPED
+
+`gradient.py:11`: MAX backward casts boolean mask to `ctx.dtype` (half) before counting. 70000 elements exceeds float16 max (65504), count overflows to inf, `1/inf = 0` kills every gradient. Fix: accumulate in `sum_acc_dtype(ctx.dtype)` (float32), cast back. Net-zero lines, same pattern as EXPAND backward (line 70). Test: `Tensor.ones(70000, dtype="half").max().backward()` — grad.sum() = 1.0.
+
+### Sou-ly #15491: toposort → dfs_match — PORTED
+
+From [Sou-ly's PR #15491](https://github.com/tinygrad/tinygrad/pull/15491) (closed as "AI SLOP", 29% measured speedup on stable_diffusion.py). Ported with attribution:
+
+1. `UOp.dfs_match` — short-circuit DFS for reachability, replacing full `toposort()` calls. ~15 lines.
+2. `recursive_property` fast path — skip toposort when direct sources already cached. ~5 lines.
+3. `op_in_backward_slice_with_self` — uses cached backward_slice or falls back to dfs_match. ~3 lines.
+4. `fix_store_after_hazard` — manual post-order DFS instead of toposort. ~10 lines.
+5. `remove_bufferize` — dfs_match replaces toposort+gate for buffer-in-reduce check. 1 line.
+
+Result: toposort calls 39K → 10K (-74%), toposort time 135ms → 97ms (-28%).
+
+---
+
+## IX. CPL scheduling generalization (this session)
+
+### H₁: CPL generalizes beyond matvec to all workloads — KILLED on Metal
+
+Implementation: 10 lines. Compute critical path length per UOp, use as scheduling priority instead of flat `{LOAD:-1, ALU:0, STORE:+1}`. Structural ops (PARAM, DEFINE_*, RANGE, END) keep fixed priorities at `±(n+k)` to avoid overlap with CPL values.
+
+**Perturbation 1: TinyJit wall-clock, 50 trials, 20 warmup.** All workloads within p10-p90 bands. No distinguishable signal above Metal dispatch noise (~150-200us/call). Same measurement methodology wall as the pareto-frontier investigation.
+
+**Perturbation 2: DEBUG=4 kernel source comparison.** Two structural findings:
+
+1. **Matvec: identical kernel source.** CPL produces character-for-character identical Metal code. Topological constraints are so tight there's no reordering freedom. The OR investigation's +23% was measured before the stride-aware fix (MV_ROWS_PER_THREAD=16). That fix changed the kernel structure and eliminated the instruction ordering opportunity CPL exploited.
+
+2. **GEMM with TC: different kernel source, same performance.** Baseline issues all 16 loads up front, then runs 4 independent WMMA chains of depth 4. CPL interleaves: 4 loads → 4 WMMAs → 4 loads → 4 WMMAs → ... (4 groups of width 4). Both have critical path length 4. GPU kernel times: 872us (baseline) vs 900us (CPL), within noise. The Metal shader compiler absorbs instruction ordering differences.
+
+**Kill conditions:**
+
+- **Heuristic-level fixes supersede instruction-level scheduling.** The stride-aware matvec fix addresses the same problem (memory access patterns) at a higher level. Once the heuristic makes the right structural decisions, instruction ordering becomes irrelevant.
+- **Metal's shader compiler normalizes instruction order.** Apple's GPU compiler performs its own scheduling, register allocation, and load/store reordering. Source-level instruction order is advisory, not binding.
+
+**Surviving edge: CUDA/HIP.** NVRTC may be less aggressive than Metal's compiler. CPL might produce measurable differences on platforms with simpler compilers. Not testable without CUDA hardware.
+
+---
+
+## X. Cython floor-lowering chain (this session)
+
+Hypothesis: Cython lowers the measurement floor, making previously-killed optimizations (bitmask, Huffman if-elif) detectable. Each layer exposes the next bottleneck.
+
+See section IV for the full chain table and reopened hypotheses. Key finding: "complexity" for the CPU is depth of indirection between source and effect — invisible layers (descriptor protocol, hash probe, method dispatch) that look identical in source but differ 6-70x at runtime. Trust is a human compression heuristic for these layers; it works for correctness but misleads on performance.
+
+---
+
 ## Open frontier
 
-### Kernel quality
-1. Theory transfer to non-matmul classes (reductions, elementwise, convolutions)
-2. Joint GROUP+LOCAL+UPCAST optimization for matvec gap (~20 lines for 2-deep mini-beam)
-3. Amortized cost measurement (52 trials vs BEAM's 200+)
-4. Theory transfer on CUDA
+Ranked by impact per line of code. Tiebreaker: fewer lines wins.
 
-### LLM inference
-5. Native Q6K matmul kernels — close the 2.6x gap without 2x memory penalty
-6. Matvec loop ordering fix at the scheduler level
-7. chunk_size sensitivity for prefill (32 vs 128 vs 256)
+| # | Edge | LOC | Expected impact | Impact/line |
+|---|---|---|---|---|
+| 1 | chunk_size sensitivity (32 vs 128 vs 256) | 1 | unknown (needs measurement) | high if positive |
+| 2 | Contiguous+prune merge (branch exists) | 0 (merge) | 14x Metal GGUF | ∞ |
+| 3 | Joint GROUP+LOCAL+UPCAST for matvec | ~20 | closes 1.10x abduction gap | medium |
+| 4 | Cythonize `rewrite` (307ms hotspot) | ~60 | -10 to -15% schedule | medium |
+| 5 | Huffman if-elif in Cython rewrite | ~30 | branch-predicted dispatch | medium (needs #4) |
+| 6 | Bitmask in Cython (eliminate descriptor overhead) | ~10 | -1% (29ms descriptor) | medium |
+| 7 | Theory transfer to non-matmul | ~50 | unknown | unknown |
+| 8 | Algebraic fusion (online softmax) | ~200 | fuse 3 kernels → 1 | low |
+| 9 | Native Q6K matmul kernels | ~300 | close 2.6x gap | low |
+| 10 | Fused dequant UOp rewrite | ~200 | depends on #9 | low |
+| ~~11~~ | ~~CPL scheduling~~ | ~~10~~ | ~~killed on Metal~~ | — |
 
-### Codegen
-8. CPL + LUC + APRP scheduling (~80-120 lines)
-9. Algebraic fusion (Flashlight for softmax, RedFuser for layernorm)
-10. Fused dequant UOp rewrite rule
-
-### Infrastructure
-11. CPython JIT for branchy dict/deque loops (contribution to CPython, not tinygrad)
-12. Extend Cython coverage beyond `unified_rewrite` — typed annotations on UOp fields would widen the gap to 15-20%
+### Killed
+- CPL + LUC + APRP — Metal shader compiler absorbs instruction order
+- Warp-reduce for sum — exp2 computation dominates; needs algorithmic fusion (#8) to unlock
 
 ---
 
@@ -351,8 +475,7 @@ Performance gap (1.2-5.9x vs torch) — CONFIRMED
 │   │   └─ non-matmul transfer — OPEN
 │   ├─ abduction loop (52 trials, 1.85x) — CONFIRMED
 │   │   └─ joint optimization for matvec — OPEN
-│   ├─ CPL scheduling (matvec +23%) — CONFIRMED
-│   │   └─ APRP register pressure ceiling — OPEN
+│   ├─ CPL scheduling — KILLED on Metal (shader compiler absorbs)
 │   └─ XOR-swizzle — KILLED on Metal
 │
 ├─ LLM inference gap — CONFIRMED (2.8x F16, 32x Q6K)
@@ -370,9 +493,23 @@ Performance gap (1.2-5.9x vs torch) — CONFIRMED
 │   ├─ Cython transpile (-7.3% e2e) — CONFIRMED, SHIPPED
 │   └─ CPython JIT improvement — OPEN
 │
-├─ Warp-reduce for GROUPTOP (2.1-4.2x) — CONFIRMED
+├─ Warp-reduce for GROUPTOP — CONFIRMED, ACTIVATED (max 3.50x, sum ~neutral)
 ├─ Renderer fallback detection — CONFIRMED
-└─ Line budget (636 headroom, onnx -29 merged) — CONFIRMED
+├─ Line budget (636 headroom, onnx -29 merged) — CONFIRMED
+│
+├─ Triage pipeline fixes (from ~/.sweep/repos/tinygrad-tinygrad)
+│   ├─ T11908: beam cache invalidation — CONFIRMED, SHIPPED
+│   ├─ T12296: max backward underflow (float16) — CONFIRMED, SHIPPED
+│   └─ Sou-ly #15491: toposort → dfs_match — PORTED (29K fewer toposort calls)
+│
+└─ Cython floor-lowering chain
+    ├─ unified_rewrite transpile (-34%) — SHIPPED
+    ├─ bitmask early-reject (-2.9%) — SHIPPED
+    ├─ int(op) descriptor fix — SHIPPED
+    ├─ list-indexed dispatch (-4.8%) — SHIPPED
+    ├─ skip mega guard (-3%) — SHIPPED
+    ├─ Cython rewrite + inline pm (-4.9%) — SHIPPED
+    └─ total: 3.457s → 1.752s (-49%)
 ```
 
 ## PRs
@@ -392,3 +529,7 @@ Performance gap (1.2-5.9x vs torch) — CONFIRMED
 | #16117 | PTX test and fix | Closed | PTX bf16 tests |
 | #16070 | Ops.WARP_REDUCE | Closed | simd_sum 2.1-4.2x |
 | #16072 | matvec MV_ROWS_PER_THREAD | Closed | 62-105% BW gain |
+| — | T11908 beam cache invalidation | **speedygrad** | Env var cache key |
+| — | T12296 max backward underflow | **speedygrad** | float16 gradient fix |
+| — | Sou-ly #15491 toposort → dfs_match | **speedygrad** | 74% fewer toposort calls |
+| — | Cython floor-lowering chain | **speedygrad** | Schedule -49% (3.46→1.75s) |

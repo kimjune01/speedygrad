@@ -109,12 +109,17 @@ class recursive_property(property):
   def __init__(self, fxn):
     self.fxn = fxn
     self.nm = "_RECURSIVE_PROPERTY_"+fxn.__name__
+    self._gate = lambda node: self.nm not in node.__dict__
     self.__doc__ = fxn.__doc__
   def __get__(self, x:UOp|None, owner=None):
     if x is None: return self
-    if self.nm in x.__dict__: return x.__dict__[self.nm]
-    for node in x.toposort(gate=lambda node: self.nm not in node.__dict__): node.__dict__[self.nm] = self.fxn(node)
-    return x.__dict__[self.nm]
+    nm = self.nm
+    if nm in x.__dict__: return x.__dict__[nm]
+    if all(nm in s.__dict__ for s in x.src):
+      x.__dict__[nm] = self.fxn(x)
+      return x.__dict__[nm]
+    for node in x.toposort(gate=self._gate): node.__dict__[nm] = self.fxn(node)
+    return x.__dict__[nm]
 
 # we import this late so we can use resolve/smax in mixins
 from tinygrad.mixin import OpMixin
@@ -163,9 +168,23 @@ class UOp(OpMixin, metaclass=UOpMetaClass):
 
   @property
   def backward_slice_with_self(self:UOp) -> dict[UOp, None]: return {self:None, **self.backward_slice}
+  # dfs_match and op_in_backward_slice_with_self optimization from Sou-ly (tinygrad PR #15491)
+  def dfs_match(self, match:Callable[['UOp'], bool], gate:Callable[['UOp'], bool]|None=None) -> bool:
+    """Short-circuit DFS. Returns True on first match(node). Optional gate controls traversal."""
+    seen: set[UOp] = set()
+    stack: list[UOp] = [self]
+    while stack:
+      node = stack.pop()
+      if node in seen: continue
+      seen.add(node)
+      if match(node): return True
+      if gate is None or gate(node): stack.extend(node.src)
+    return False
+
   def op_in_backward_slice_with_self(self, *ops:Ops) -> bool:
-    # Check self first, then iterate backward_slice (avoids creating intermediate dict)
-    return self.op in ops or any(x.op in ops for x in self.backward_slice)
+    if self.op in ops: return True
+    if "backward_slice" in self.__dict__: return any(x.op in ops for x in self.backward_slice)
+    return self.dfs_match(lambda node: node.op in ops)
 
   def toposort(self, gate:Callable|None=None, enter_calls=True) -> dict[UOp, None]:
     cache: dict[UOp, None] = {}
@@ -1247,11 +1266,16 @@ class PatternMatcher:
     # uop is required, arg is optional
     for p,fxn in self.patterns:
       assert p.op is not None
-      entry: list = [p, None, p.early_reject]
+      er_mask = 0
+      for op in p.early_reject: er_mask |= 1 << int(op)
+      entry: list = [p, None, er_mask]
       entry[1] = upat_deferred_compile(p, fxn, entry) if compiled else upat_interpret(p, fxn)
       for uop in p.op: self.pdict.setdefault(uop, []).append(entry)
+    self._plist: list[list[list]|None] = [None] * (max(int(op) for op in Ops) + 1)
+    for op, entries in self.pdict.items(): self._plist[int(op)] = entries
     self._mega: dict[Ops, Callable|None] = {}
-    if compiled and bool(getenv("MEGA_MATCH")):
+    self._use_mega = compiled and bool(getenv("MEGA_MATCH"))
+    if self._use_mega:
       self._fxn_map: dict[int, Callable] = {id(p): fxn for p, fxn in self.patterns}
 
   def __reduce__(self): return PatternMatcher, ([(x,deconstruct_function(fxn) if fxn.__name__ == "<lambda>" else fxn) for x,fxn in self.patterns],)
@@ -1260,24 +1284,28 @@ class PatternMatcher:
   def __add__(self, more:PatternMatcher) -> PatternMatcher: return PatternMatcher(self.patterns+more.patterns)
 
   def rewrite(self, uop:UOp, ctx=None):
-    if len(pats:=self.pdict.get(uop.op, [])):
-      if uop.op in self._mega:
-        mega = self._mega[uop.op]
-        if mega is not None:
-          ret = mega(uop, ctx)
-          if ret is not None and ret is not uop: return ret
-          return None
-      elif hasattr(self, '_fxn_map') and len(pats) >= 2:
-        from tinygrad.uop.upat import mega_compile
-        mega = mega_compile(tuple((e[0], self._fxn_map[id(e[0])]) for e in pats))
-        self._mega[uop.op] = mega
-        if mega is not None:
-          ret = mega(uop, ctx)
-          if ret is not None and ret is not uop: return ret
-          return None
-      if (ler:=uop.__dict__.get('_src_ops')) is None: uop.__dict__['_src_ops'] = ler = {u.op for u in uop.src}
+    if (pats:=self._plist[uop.op]) is not None:
+      if self._use_mega:
+        if uop.op in self._mega:
+          mega = self._mega[uop.op]
+          if mega is not None:
+            ret = mega(uop, ctx)
+            if ret is not None and ret is not uop: return ret
+            return None
+        elif len(pats) >= 2:
+          from tinygrad.uop.upat import mega_compile
+          mega = mega_compile(tuple((e[0], self._fxn_map[id(e[0])]) for e in pats))
+          self._mega[uop.op] = mega
+          if mega is not None:
+            ret = mega(uop, ctx)
+            if ret is not None and ret is not uop: return ret
+            return None
+      if (ler:=uop.__dict__.get('_src_ops_mask')) is None:
+        m = 0
+        for u in uop.src: m |= 1 << int(u.op)
+        uop.__dict__['_src_ops_mask'] = ler = m
       for _,match,early_reject in pats:
-        if not early_reject.issubset(ler): continue
+        if (early_reject & ler) != early_reject: continue
         if (ret:=match(uop, ctx)) is not None and ret is not uop: return ret
     return None
 
@@ -1369,11 +1397,12 @@ class TrackedPatternMatcher(PatternMatcher):
   def rewrite(self, uop:UOp, ctx=None):
     if len(pats:=self.pdict.get(uop.op, [])):
       ret = None
-      ler = {u.op for u in uop.src}
+      ler = 0
+      for u in uop.src: ler |= 1 << int(u.op)
       for p,match,early_reject in pats:
         if p not in match_stats: match_stats[p] = [0,0,0.0,0.0]
         st = time.perf_counter()
-        if not early_reject.issubset(ler):
+        if (early_reject & ler) != early_reject:
           match_stats[p][2] += time.perf_counter()-st
           continue
         match_stats[p][1] += 1

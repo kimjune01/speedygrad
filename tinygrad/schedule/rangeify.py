@@ -83,10 +83,20 @@ def fix_store_hazard(target:UOp, src:UOp):
   # PERMUTE and FLIP reorder indices, SHRINK can have overlapping regions when dest is also shrunk
   unsafe = {Ops.PERMUTE, Ops.FLIP} | ({Ops.SHRINK} if target.op_in_backward_slice_with_self(Ops.SHRINK) else set())
   base = target.base
+  # post-order DFS to propagate reaches_base bottom-up (from Sou-ly, tinygrad PR #15491)
   reaches_base: dict[UOp, bool] = {}
-  for s in src.toposort(gate=lambda s: s.op is not Ops.CONTIGUOUS):
-    reaches_base[s] = s is base or any(reaches_base.get(c) for c in s.src)
-    if reaches_base[s] and s.op in unsafe: return target.store(src.contiguous())
+  stack: list[tuple[UOp, bool]] = [(src, False)]
+  while stack:
+    node, visited = stack.pop()
+    if node in reaches_base: continue
+    if not visited:
+      if node.op is not Ops.CONTIGUOUS:
+        stack.append((node, True))
+        for s in node.src: stack.append((s, False))
+      else: reaches_base[node] = False
+    else:
+      reaches_base[node] = node is base or any(reaches_base.get(c) for c in node.src)
+      if reaches_base[node] and node.op in unsafe: return target.store(src.contiguous())
 
 def split_reduceop(reduce:UOp, x:UOp):
   if prod(reduce.shape) == 0: return None
@@ -265,14 +275,8 @@ def remove_bufferize(src:UOp, buf:UOp, idx:UOp):
   # if this is generated from multiple buffers, don't remove this buffer
   if len(accessed_buffers) > 3 and not (PCONTIG > 2): return None
 
-  # if any reduces access a buffer, don't remove this buffer
-  buffer_in_reduce = False
-  def buf_gate(x:UOp):
-    nonlocal buffer_in_reduce
-    if x.op in {Ops.PARAM, Ops.BUFFERIZE}: buffer_in_reduce = True
-    return not buffer_in_reduce
-  UOp.sink(*[x.src[0] for x in reduces]).toposort(gate=buf_gate)
-  del buf_gate
+  # if any reduces access a buffer, don't remove this buffer (from Sou-ly, tinygrad PR #15491)
+  buffer_in_reduce = reduces and UOp.sink(*[x.src[0] for x in reduces]).dfs_match(lambda x: x.op in {Ops.PARAM, Ops.BUFFERIZE})
   if buffer_in_reduce:
     if PCONTIG > 2:
       out_in_ratio = (prod(buf.shape)+1) / (sum([x.numel() for x in accessed_buffers])+1)

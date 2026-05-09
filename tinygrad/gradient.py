@@ -9,9 +9,9 @@ def reduce_gradient(ctx:UOp, ret:UOp, op:Ops):
   if op == Ops.ADD: return (broadcast_to_input(ctx),)
   if op == Ops.MAX:
     assert ret.op is Ops.REDUCE, "only works on REDUCE"
-    mask = ret.src[0].eq(broadcast_to_input(ret)).cast(ctx.dtype)
+    mask = ret.src[0].eq(broadcast_to_input(ret)).cast(sum_acc_dtype(ctx.dtype))
     count = mask._rop(Ops.ADD, ret.arg[1])
-    return ((mask/broadcast_to_input(count)) * broadcast_to_input(ctx),)
+    return ((mask/broadcast_to_input(count)).cast(ctx.dtype) * broadcast_to_input(ctx),)
   if op == Ops.MUL: return (broadcast_to_input(ctx * ret) / ret.src[0],)
 
 def _compact_params(body:UOp, all_args:tuple[UOp, ...]) -> tuple[UOp, tuple[UOp, ...]]:

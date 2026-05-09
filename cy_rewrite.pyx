@@ -6,6 +6,50 @@ from tinygrad.uop.ops import UOp, Ops, unwrap, BottomUpGate
 cdef object SENTINEL = object()
 cdef set CALL_OPS = {Ops.CALL, Ops.FUNCTION}
 
+def cy_rewrite(self, uop, ctx=None):
+    """Cython-compiled PatternMatcher.rewrite — bitmask early-reject + move-toward-front on hit."""
+    cdef list pats = self._plist[uop.op]
+    if pats is None:
+        return None
+    if self._use_mega:
+        if uop.op in self._mega:
+            mega = self._mega[uop.op]
+            if mega is not None:
+                ret = mega(uop, ctx)
+                if ret is not None and ret is not uop: return ret
+                return None
+        elif len(pats) >= 2:
+            from tinygrad.uop.upat import mega_compile
+            mega = mega_compile(tuple((e[0], self._fxn_map[id(e[0])]) for e in pats))
+            self._mega[uop.op] = mega
+            if mega is not None:
+                ret = mega(uop, ctx)
+                if ret is not None and ret is not uop: return ret
+                return None
+    cdef dict uop_dict = uop.__dict__
+    cached = uop_dict.get('_src_ops_mask')
+    cdef object ler
+    if cached is None:
+        ler = 0
+        for u in uop.src:
+            ler |= 1 << int(u.op)
+        uop_dict['_src_ops_mask'] = ler
+    else:
+        ler = cached
+    cdef int i
+    cdef int n = len(pats)
+    cdef list entry
+    cdef object er
+    for i in range(n):
+        entry = <list>pats[i]
+        er = entry[2]
+        if (er & ler) != er:
+            continue
+        ret = (<object>entry[1])(uop, ctx)
+        if ret is not None and ret is not uop:
+            return ret
+    return None
+
 def cy_unified_rewrite(self, root):
     cdef dict replace = self.replace
     stack = collections.deque([(root, 0, root)])
@@ -17,6 +61,8 @@ def cy_unified_rewrite(self, root):
     cdef bint enter_calls = self.enter_calls
     pm = self.pm
     bpm = self.bpm
+    ctx = self.ctx
+    cdef dict bpm_cache = self._bpm_cache if bpm is not None else {}
 
     while stack:
         if len(stack) > 250000:
@@ -71,7 +117,7 @@ def cy_unified_rewrite(self, root):
                     if n in waitlist:
                         stack.extend(waitlist.pop(n))
                     continue
-                new_src_n = self.pm_rewrite(new_n)
+                new_src_n = pm.rewrite(new_n, ctx)
                 if new_src_n is None:
                     replace[n] = new_n
                     if n in waitlist:
