@@ -498,6 +498,16 @@ This is the largest single finding of the session. The GPU hardware is neutral (
 
 **Key investigation finding:** the test was blocking the optimization by asserting implementation details. The test was correct for the OLD kernel structure but wrong for the IMPROVED one. "There is no first-principles reason that it's not possible" — the barrier was a test, not physics.
 
+### Abduction engine results (bench/abduct.py)
+
+Three perturbations, figure-ground separation confirmed:
+
+1. **Size 256→4096**: heuristic DROPS GROUPTOP at large sizes, switches to UPCAST+LOCAL+UNROLL. The 6.6x online softmax advantage at 4096 is partly from the heuristic choosing worse opts, not just L2 locality.
+2. **Sum vs softmax**: "no diff" — same opts, different kernel count. The engine correctly identifies the fix is algorithmic (fusion), not heuristic.
+3. **float32 vs float16**: "no diff" — dtype doesn't change the opt surface. Performance difference is hardware throughput.
+
+The engine tells you WHERE to look: heuristic opts (figure) vs kernel structure vs hardware (ground). Two samples, one diff.
+
 **H: Morton-ordered tile loading for fused dequant.** Interleave quantized weight bytes and scale factors so they share cache lines, rather than loading from separate memory regions. Same principle as GPU texture swizzling — bit-interleaving preserves 2D locality in 1D memory. Perturbation: compare sequential vs Morton-ordered Q6K block loading in the dequant kernel.
 
 **H: Cache-aware kernel graph tiling.** Instead of running each kernel on the full input (flush L2 between kernels), subdivide input into L2-sized fragments and run all kernels on each fragment before moving to the next. The online softmax prototype already does this implicitly (both passes in one kernel = one fragment). Generalizing to arbitrary kernel graphs would make multi-kernel pipelines cache-friendly without per-pipeline fusion. Perturbation: for softmax, compare 3 separate kernels with L2-tiled scheduling vs online softmax.
