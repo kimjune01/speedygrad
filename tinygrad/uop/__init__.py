@@ -59,6 +59,9 @@ class Ops(FastEnum):
   # warp-level reduction (simd_sum on Metal, __shfl_down_sync loop on CUDA)
   WARP_REDUCE = auto()
 
+  # online softmax compound reduction: produces (max, sum_exp) in one pass
+  SOFTMAX_REDUCE = auto()
+
   # UnaryOps
   CAST = auto(); BITCAST = auto(); EXP2 = auto(); LOG2 = auto(); SIN = auto()
   SQRT = auto(); RECIPROCAL = auto(); NEG = auto(); TRUNC = auto()
