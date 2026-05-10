@@ -163,7 +163,7 @@ pm_to_program = PatternMatcher([
 @Context(ALLOW_DEVICE_USAGE=0)
 def do_to_program(ast:UOp, renderer:Renderer) -> UOp:
   """
-  Transform an AST into a compiled PROGRAM. May trigger BEAM search.
+  Transform an AST into a compiled PROGRAM. May trigger abduction search.
 
   Args:
     ast: The Ops.SINK/Ops.PROGRAM rooted AST

@@ -1,7 +1,7 @@
 from typing import TypeVar, Generic, Callable, Any
 import functools, collections
 from tinygrad.tensor import Tensor
-from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, BEAM, getenv, JIT, JIT_BATCH_SIZE, dedup, pluralize, VIZ
+from tinygrad.helpers import flatten, merge_dicts, DEBUG, Context, SEARCH, getenv, JIT, JIT_BATCH_SIZE, dedup, pluralize, VIZ
 from tinygrad.device import Buffer, Compiled, Device, MultiBuffer
 from tinygrad.dtype import DType, dtypes
 from tinygrad.uop.ops import UOp, PatternMatcher, Variable, sym_infer, Ops, buffers, track_rewrites, graph_rewrite
@@ -258,7 +258,7 @@ class TinyJit(Generic[ReturnType]):
     if not JIT or self.cnt == 0:
       # jit ignore
       assert self.fxn is not None
-      with Context(SEARCH=0 if getenv("IGNORE_JIT_FIRST_BEAM") else SEARCH.value):
+      with Context(SEARCH=0 if getenv("IGNORE_JIT_FIRST_SEARCH") else SEARCH.value):
         ret = self.fxn(*args, **kwargs)
         if len(params:=get_parameters(ret)): Tensor.realize(*params)
     elif self.cnt == 1:

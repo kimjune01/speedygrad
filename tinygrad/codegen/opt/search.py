@@ -48,7 +48,7 @@ def _time_program(prg:UOp, var_vals:dict[str, int], rawbufs:list[Buffer], early_
     if clear_l2:
       if hasattr(dev:=Device[prg.src[1].arg], 'invalidate_caches'): dev.invalidate_caches()
       else:
-        with Context(DEBUG=0, BEAM=0, CAPTURING=0, TRACK_MATCH_STATS=0): Tensor.ones(1024,1024).contiguous().realize(do_update_stats=False)
+        with Context(DEBUG=0, SEARCH=0, CAPTURING=0, TRACK_MATCH_STATS=0): Tensor.ones(1024,1024).contiguous().realize(do_update_stats=False)
     tms.append(unwrap(rt(*bufs, global_size=global_size, local_size=local_size, vals=prg.arg.vals(var_vals), wait=True, timeout=timeout))*factor)
     if early_stop is not None and early_stop < min(tms): break
   return tms
