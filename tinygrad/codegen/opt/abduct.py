@@ -114,7 +114,29 @@ def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_ca
 
     if not hypotheses: break
 
-    winner = max(hypotheses, key=lambda h: h.speedup)
+    # Re-validate the top candidates at higher cnt before committing. The cnt=3 search
+    # has enough noise to make a no-op-ish opt (e.g. UNROLL(0,0)) look like the winner
+    # in ~17% of runs (gemm_256: 106us vs 55us). Re-time the top 3 at cnt=7 and pick
+    # the best of those — bounds search noise without adding much cost.
+    hypotheses.sort(key=lambda h: -h.speedup)
+    top_k = hypotheses[:3]
+    if len(top_k) > 1:
+      revalidated = []
+      for h in top_k:
+        _, recompiled = _try_compile((0, h.scheduler))
+        if recompiled is None: continue
+        try:
+          rt = min(_time_program(recompiled[0], var_vals, rawbufs, cnt=7))
+        except (RuntimeError, AssertionError): continue
+        revalidated.append(Hypothesis(scheduler=h.scheduler, opt=h.opt, after=rt,
+                                       speedup=best_time / rt if rt > 0 else 0))
+      if revalidated:
+        winner = max(revalidated, key=lambda h: h.speedup)
+      else:
+        winner = top_k[0]
+    else:
+      winner = top_k[0]
+
     if winner.speedup <= 1.01:
       if DEBUG >= 2: print(f"ABDUCT d{depth}: converged (best hypothesis {winner.speedup:.3f}x)")
       break
@@ -176,7 +198,21 @@ def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_ca
           hypotheses.append(Hypothesis(scheduler=candidate, opt=candidate.applied_opts[-1],
                                        after=t, speedup=best_time / t if t > 0 else 0))
         if not hypotheses: break
-        winner = max(hypotheses, key=lambda h: h.speedup)
+        # same top-k re-validation as the main search loop
+        hypotheses.sort(key=lambda h: -h.speedup)
+        top_k = hypotheses[:3]
+        if len(top_k) > 1:
+          rev = []
+          for h in top_k:
+            _, rc = _try_compile((0, h.scheduler))
+            if rc is None: continue
+            try: rt = min(_time_program(rc[0], var_vals, rawbufs, cnt=7))
+            except (RuntimeError, AssertionError): continue
+            rev.append(Hypothesis(scheduler=h.scheduler, opt=h.opt, after=rt,
+                                   speedup=best_time / rt if rt > 0 else 0))
+          winner = max(rev, key=lambda h: h.speedup) if rev else top_k[0]
+        else:
+          winner = top_k[0]
         if winner.speedup <= 1.01: break
         best = winner.scheduler
         best_time = winner.after
