@@ -32,6 +32,13 @@ class ReduceMixin(DTypeMixin, MovementMixin):
     return self.shrink(slc)
 
   def _reduce(self, op:Ops, axis:int|Sequence[int]|None=None, keepdim=False) -> Self:
+    if isinstance(axis, int) and self.ndim > 0 and op is Ops.MAX:
+      ax = self._resolve_dim(axis)
+      dim = self.shape[ax]
+      if isinstance(dim, int) and dim > 32 and dim % 32 != 0:
+        pad_val = -1e38 if op == Ops.MAX else 0.0
+        x, _ = self._pad_reduce_axis(axis, pad_val)
+        return x._reduce(op, axis, keepdim)
     axis = tuple(self._resolve_dim(x) for x in (range(self.ndim) if axis is None else make_tuple(axis, 1)))
     if self.ndim == 0: axis = ()
     ret = self._rop(op, axis)
@@ -111,8 +118,7 @@ class ReduceMixin(DTypeMixin, MovementMixin):
     print(t.max(axis=1, keepdim=True).numpy())
     ```
     """
-    x, _ = self._pad_reduce_axis(axis, pad_val=-float('inf'))
-    return x._reduce(Ops.MAX, axis, keepdim)
+    return self._reduce(Ops.MAX, axis, keepdim)
 
   def any(self, axis:int|Sequence[int]|None=None, keepdim=False) -> Self:
     """
