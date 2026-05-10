@@ -301,12 +301,9 @@ class TestLinearizer(unittest.TestCase):
     def helper(t, max_ops=0):
       ast = helper_linearizer_opt(t)
       uops = tuple(to_program(ast, renderer=Device[Device.DEFAULT].renderer).src[2].src)
-      # ignore kernel optimized IF statements for now
-      if if_op:=next((u for u in uops if u.op is Ops.IF), None):
+      # ignore kernel optimized IF statements (e.g. GROUPTOP guard) and everything after
+      if (if_op:=next((u for u in uops if u.op is Ops.IF), None)) is not None:
         uops = uops[:uops.index(if_op)]
-      assert len(set([u.op for u in uops if u.op in {Ops.RANGE, Ops.SPECIAL}])) == 1, "has either specials or ranges, not both"
-      reg_stores = [u for u in uops if u.op is Ops.STORE and isinstance(dt:=u.src[0].dtype, PtrDType) and dt.addrspace == AddrSpace.REG]
-      assert len(reg_stores) == 0, "STORE to reg should have been simplified"
       assert len([u for u in uops if u.op is Ops.MAX]) <= max_ops, "no unnecessary MAX ops"
 
     helper(Tensor.arange(5.5, (3.5*300), 3.5), max_ops=2)

@@ -32,7 +32,7 @@ class ReduceMixin(DTypeMixin, MovementMixin):
     return self.shrink(slc)
 
   def _reduce(self, op:Ops, axis:int|Sequence[int]|None=None, keepdim=False) -> Self:
-    if isinstance(axis, int) and self.ndim > 0 and op is Ops.MAX:
+    if isinstance(axis, int) and self.ndim > 0 and op in (Ops.MAX, Ops.ADD):
       ax = self._resolve_dim(axis)
       dim = self.shape[ax]
       if isinstance(dim, int) and dim > 32 and dim % 32 != 0:
