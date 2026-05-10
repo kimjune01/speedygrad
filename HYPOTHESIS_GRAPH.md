@@ -466,6 +466,22 @@ The real unlock is running the abduction loop on the current machine to get meas
 - ~~Inline cached_bpm_rewrite~~ — shipped
 - ~~Sou-ly #15491 dfs_match~~ — ported with attribution
 
+### New hypotheses (from tiling geometry discussion)
+
+**H: Dimension standardization eliminates tile search.** Pad all reduction dimensions to multiples of 32 (warp size), all matmul dimensions to multiples of TC shape (8 or 16). Overhead is O(surface)/O(volume) — 0.07% at 4096, negligible at LLM scale. If inputs are standardized, the abduction engine's job collapses: find optimal tile for 5 standard shapes, cache forever. Theory transfer dissolves because every instance IS the reference shape.
+
+Perturbation: auto-pad tensors at construction to next multiple of 32. Measure overhead (memory + wasted compute) vs benefit (fixed kernel templates, no bounds checking, guaranteed alignment).
+
+Two implementation levels:
+- Tensor-level: `Tensor.__init__` auto-pads, all downstream kernels benefit. Visible to user.
+- Kernel-level: pad inside kernel template, invisible to user but per-kernel complexity.
+
+Null: padding overhead exceeds the benefit of fixed templates for small tensors (33→64 = 276% waste).
+
+**H: Morton-ordered tile loading for fused dequant.** Interleave quantized weight bytes and scale factors so they share cache lines, rather than loading from separate memory regions. Same principle as GPU texture swizzling — bit-interleaving preserves 2D locality in 1D memory. Perturbation: compare sequential vs Morton-ordered Q6K block loading in the dequant kernel.
+
+**H: Cache-aware kernel graph tiling.** Instead of running each kernel on the full input (flush L2 between kernels), subdivide input into L2-sized fragments and run all kernels on each fragment before moving to the next. The online softmax prototype already does this implicitly (both passes in one kernel = one fragment). Generalizing to arbitrary kernel graphs would make multi-kernel pipelines cache-friendly without per-pipeline fusion. Perturbation: for softmax, compare 3 separate kernels with L2-tiled scheduling vs online softmax.
+
 ### Killed
 - CPL + LUC + APRP — Metal shader compiler absorbs instruction order
 - Huffman branch prediction — bitmask subsumes; 93% skip rate means ordering is irrelevant (4.5ms max)
