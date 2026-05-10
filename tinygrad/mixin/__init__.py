@@ -574,9 +574,8 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     print(t.softmax(axis=0).numpy())
     ```
     """
-    x, orig = self._pad_reduce_axis(axis, pad_val=-float('inf'))
-    _, e, ss = x._softmax(axis, dtype)
-    return (e * ss.reciprocal())._unpad_axis(axis, orig)
+    _, e, ss = self._softmax(axis, dtype)
+    return e * ss.reciprocal()
 
   def log_softmax(self, axis=-1, dtype:DTypeLike|None=None) -> Self:
     """
@@ -598,9 +597,8 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     print(t.log_softmax(axis=0).numpy())
     ```
     """
-    x, orig = self._pad_reduce_axis(axis, pad_val=-float('inf'))
-    m, _, ss = x._softmax(axis, dtype)
-    return (m - ss.log())._unpad_axis(axis, orig)
+    m, _, ss = self._softmax(axis, dtype)
+    return m - ss.log()
 
   def cat(self, *args:Self, dim:int=0) -> Self:
     """

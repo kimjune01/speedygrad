@@ -25,12 +25,6 @@ class ReduceMixin(DTypeMixin, MovementMixin):
     if ret.dtype != self.dtype: ret = ret.cast(self.dtype)
     return ret, dim
 
-  def _unpad_axis(self, axis:int, orig_dim:int|None) -> Self:
-    if orig_dim is None: return self
-    ax = self._resolve_dim(axis)
-    slc = tuple((0, s) for s in self.shape[:ax]) + ((0, orig_dim),) + tuple((0, s) for s in self.shape[ax+1:])
-    return self.shrink(slc)
-
   def _reduce(self, op:Ops, axis:int|Sequence[int]|None=None, keepdim=False) -> Self:
     if isinstance(axis, int) and self.ndim > 0 and op in (Ops.MAX, Ops.ADD):
       ax = self._resolve_dim(axis)
