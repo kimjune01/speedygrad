@@ -484,20 +484,19 @@ Pad-compute-truncate (4093→4096, pad with -inf, shrink output) recovers 92% of
 
 This is the largest single finding of the session. The GPU hardware is neutral (p10 identical for 4093 vs 4096 in raw kernel benchmarks). The ENTIRE 9.2x comes from the heuristic choosing a different kernel structure.
 
-**Auto-padder shipped for softmax + log_softmax.** 21 lines, 6.8x on dim=4093. Codex-reviewed (4 edge cases fixed: 0-D, float16, axis=None, symbolic dims).
+**Universal padder shipped in `_reduce`.** 5 lines in `reduce.py`, covers ALL MAX and ADD reductions. Uses -1e38 for MAX (finite, avoids argmax overflow), 0.0 for ADD (identity). Every reduction op now hits GROUPTOP=32 on misaligned dimensions.
 
-**GROUPTOP cliff is universal.** Every reduction op (sum, max, mean, var, std, logsumexp, argmax) produces 0 GROUPTOP kernels at dim=4093 vs 1-2 at dim=4096. Pad-safe ops that could use the same pattern:
+| Op | Pad value | Status |
+|---|---|---|
+| max, argmax, softmax, log_softmax | -1e38 | **SHIPPED** (via `_reduce`) |
+| sum, mean, var, std, layernorm, logsumexp | 0.0 | **SHIPPED** (via `_reduce`) |
+| prod | — | skipped (MUL has no safe identity for padding) |
 
-| Op | Pad value | Safe? | Notes |
-|---|---|---|---|
-| logsumexp | -inf | yes | exp(-inf)=0 |
-| max | -inf | yes | doesn't affect max |
-| sum | 0 | yes | doesn't affect sum |
-| mean | — | NO | zeros shift mean |
-| var/std | — | NO | zeros shift variance |
-| argmax | -inf | partial | output index may point to padded position |
+**First line reduction achieved.** GROUPTOP fallback `(32, 16)` → `(32,)` — the 16 fallback is dead code because `_reduce` guarantees 32-divisible dimensions.
 
-Line reduction blocked until padder covers all safe ops. PADTO infrastructure (16 lines) and `.divides()` guards (17 lines) serve non-padded ops and TC padding.
+**test_phi_simplification relaxed.** Removed assertions on kernel structure (RANGE vs SPECIAL, reg stores) that GROUPTOP intentionally changes. Fixed UOp `__bool__` bug in IF detection. Retained MAX op count check (correctness-relevant).
+
+**Key investigation finding:** the test was blocking the optimization by asserting implementation details. The test was correct for the OLD kernel structure but wrong for the IMPROVED one. "There is no first-principles reason that it's not possible" — the barrier was a test, not physics.
 
 **H: Morton-ordered tile loading for fused dequant.** Interleave quantized weight bytes and scale factors so they share cache lines, rather than loading from separate memory regions. Same principle as GPU texture swizzling — bit-interleaving preserves 2D locality in 1D memory. Perturbation: compare sequential vs Morton-ordered Q6K block loading in the dequant kernel.
 
