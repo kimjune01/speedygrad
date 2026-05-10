@@ -548,6 +548,26 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     m = self.max(axis=axis, keepdim=True)
     return (self - m).exp().sum(axis=axis, keepdim=keepdim).log() + (m if keepdim else m.squeeze(axis))
 
+  def _pad_reduce_axis(self, axis:int, pad_val:float=0.0) -> tuple[Self, int|None]:
+    """Pad a single reduction axis to the next multiple of 32 so GROUPTOP=32 can fire."""
+    if self.ndim == 0 or not isinstance(axis, int): return self, None
+    ax = self._resolve_dim(axis)
+    dim = self.shape[ax]
+    if not isinstance(dim, int): return self, None
+    padded = ((dim + 31) // 32) * 32
+    if padded == dim: return self, None
+    pad_width = [(0,0)] * self.ndim
+    pad_width[ax] = (0, padded - dim)
+    ret = self.pad(pad_width, value=pad_val)
+    if ret.dtype != self.dtype: ret = ret.cast(self.dtype)
+    return ret, dim
+
+  def _unpad_axis(self, axis:int, orig_dim:int|None) -> Self:
+    if orig_dim is None: return self
+    ax = self._resolve_dim(axis)
+    slc = tuple((0, s) for s in self.shape[:ax]) + ((0, orig_dim),) + tuple((0, s) for s in self.shape[ax+1:])
+    return self.shrink(slc)
+
   def _softmax(self, axis, dtype:DTypeLike|None=None) -> tuple[Self, Self, Self]:
     m = self - self.max(axis=axis, keepdim=True).detach()
     if dtype is not None: m = m.cast(to_dtype(dtype))
@@ -574,8 +594,9 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     print(t.softmax(axis=0).numpy())
     ```
     """
-    _, e, ss = self._softmax(axis, dtype)
-    return e * ss.reciprocal()
+    x, orig = self._pad_reduce_axis(axis, pad_val=-float('inf'))
+    _, e, ss = x._softmax(axis, dtype)
+    return (e * ss.reciprocal())._unpad_axis(axis, orig)
 
   def log_softmax(self, axis=-1, dtype:DTypeLike|None=None) -> Self:
     """
