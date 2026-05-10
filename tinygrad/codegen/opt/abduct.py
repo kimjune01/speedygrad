@@ -9,7 +9,7 @@ Two samples, one diff, the shape of the failure names the next experiment.
 from dataclasses import dataclass
 from tinygrad.uop.ops import UOp
 from tinygrad.device import Buffer
-from tinygrad.helpers import DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, IGNORE_BEAM_CACHE
+from tinygrad.helpers import DEBUG, CACHELEVEL, diskcache_get, diskcache_put, getenv, IGNORE_SEARCH_CACHE
 from tinygrad.codegen.opt import Opt, OptOps
 from tinygrad.codegen.opt.search import _time_program, _try_compile, _ensure_buffer_alloc, get_kernel_actions
 from tinygrad.codegen.opt.postrange import Scheduler
@@ -34,7 +34,7 @@ _TRANSITIONS: dict[OptOps, set[OptOps]] = {
   OptOps.PADTO:    {OptOps.PADTO, OptOps.UPCAST, OptOps.LOCAL},
 }
 
-def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_cache=IGNORE_BEAM_CACHE.value) -> Scheduler:
+def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_cache=IGNORE_SEARCH_CACHE.value) -> Scheduler:
   """Hypothesis-driven search. O(depth * filtered_actions) trials.
 
   1. Time the default (heuristic) kernel
