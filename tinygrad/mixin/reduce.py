@@ -11,6 +11,26 @@ class ReduceMixin(DTypeMixin, MovementMixin):
   def _rop(self, op: Ops, axis: tuple[int, ...]) -> Self:
     raise NotImplementedError
 
+  def _pad_reduce_axis(self, axis:int, pad_val:float=0.0) -> tuple[Self, int|None]:
+    """Pad a single reduction axis to the next multiple of 32 so GROUPTOP=32 can fire."""
+    if self.ndim == 0 or not isinstance(axis, int): return self, None
+    ax = self._resolve_dim(axis)
+    dim = self.shape[ax]
+    if not isinstance(dim, int): return self, None
+    padded = ((dim + 31) // 32) * 32
+    if padded == dim: return self, None
+    pad_width = [(0,0)] * self.ndim
+    pad_width[ax] = (0, padded - dim)
+    ret = self.pad(pad_width, value=pad_val)
+    if ret.dtype != self.dtype: ret = ret.cast(self.dtype)
+    return ret, dim
+
+  def _unpad_axis(self, axis:int, orig_dim:int|None) -> Self:
+    if orig_dim is None: return self
+    ax = self._resolve_dim(axis)
+    slc = tuple((0, s) for s in self.shape[:ax]) + ((0, orig_dim),) + tuple((0, s) for s in self.shape[ax+1:])
+    return self.shrink(slc)
+
   def _reduce(self, op:Ops, axis:int|Sequence[int]|None=None, keepdim=False) -> Self:
     axis = tuple(self._resolve_dim(x) for x in (range(self.ndim) if axis is None else make_tuple(axis, 1)))
     if self.ndim == 0: axis = ()
