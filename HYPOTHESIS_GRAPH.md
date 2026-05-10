@@ -508,6 +508,22 @@ Three perturbations, figure-ground separation confirmed:
 
 The engine tells you WHERE to look: heuristic opts (figure) vs kernel structure vs hardware (ground). Two samples, one diff.
 
+### Abduction vs heuristic head-to-head — CONCLUSIVE
+
+18 kernels, 4 workloads (softmax, sum, layernorm, matmul). Same hardware, same timing.
+
+| Metric | Heuristic (champion) | Abduction (challenger) |
+|---|---|---|
+| Total kernel time | 830us | 351us |
+| Compile trials | 0 | 571 (32/kernel avg) |
+| Wins | 1 | 11 |
+| Ties | 6 | 6 |
+| **Speedup** | — | **57.7%** |
+
+The abduction engine is strictly better when 32 trials per kernel are affordable. One loss (matmul k4: 4→18us) from overfit — engine should compare against original default, not just previous depth. Bug noted.
+
+GROUPTOP=64 found automatically for reduction kernels (16.5x over default). The heuristic hardcodes 32; the engine discovers 64 is better for large dims.
+
 **H: Morton-ordered tile loading for fused dequant.** Interleave quantized weight bytes and scale factors so they share cache lines, rather than loading from separate memory regions. Same principle as GPU texture swizzling — bit-interleaving preserves 2D locality in 1D memory. Perturbation: compare sequential vs Morton-ordered Q6K block loading in the dequant kernel.
 
 **H: Cache-aware kernel graph tiling.** Instead of running each kernel on the full input (flush L2 between kernels), subdivide input into L2-sized fragments and run all kernels on each fragment before moving to the next. The online softmax prototype already does this implicitly (both passes in one kernel = one fragment). Generalizing to arbitrary kernel graphs would make multi-kernel pipelines cache-friendly without per-pipeline fusion. Perturbation: for softmax, compare 3 separate kernels with L2-tiled scheduling vs online softmax.
