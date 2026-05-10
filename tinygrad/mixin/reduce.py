@@ -111,7 +111,8 @@ class ReduceMixin(DTypeMixin, MovementMixin):
     print(t.max(axis=1, keepdim=True).numpy())
     ```
     """
-    return self._reduce(Ops.MAX, axis, keepdim)
+    x, _ = self._pad_reduce_axis(axis, pad_val=-float('inf'))
+    return x._reduce(Ops.MAX, axis, keepdim)
 
   def any(self, axis:int|Sequence[int]|None=None, keepdim=False) -> Self:
     """
