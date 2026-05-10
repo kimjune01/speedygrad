@@ -40,6 +40,8 @@ Shapes: N=1024 for gemm/mul\_sum, 256 for gemm\_256/softmax/layernorm/permute, 4
 - `OptOps.PADTO` — replaced by Tensor-level padding
 - Structure test assertions — blocked optimization without proving correctness
 
+Net: **-148 lines** across `tinygrad/` and `test/` (+300, -448) vs upstream at fork point. Measured by `git diff 72a504471..HEAD --stat -- tinygrad/ test/`.
+
 ## How to use
 
 ```bash
