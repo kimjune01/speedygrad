@@ -632,3 +632,5 @@ Performance gap (1.2-5.9x vs torch) — CONFIRMED
 | — | T12296 max backward underflow | **speedygrad** | float16 gradient fix |
 | — | Sou-ly #15491 toposort → dfs_match | **speedygrad** | 74% fewer toposort calls |
 | — | Cython floor-lowering chain | **speedygrad** | Schedule -49% (3.46→1.75s) |
+
+- ~~Pre-compile dedup~~ — 1% waste (2/224 duplicate compiles). Post-compile `seen_libs` already handles it. Nothing to save.
