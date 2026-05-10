@@ -55,17 +55,14 @@ def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_ca
   rawbufs = _ensure_buffer_alloc(rawbufs)
   var_vals = {k.expr:int(k.vmax+k.vmin)//2 for k in s.ast.variables()}
 
-  # phase 0: try TC first — structural transform, not search
-  # TC is provable from the AST (matmul pattern + compatible dtypes)
-  # the proxy measurement makes TC appear slower at test scale, so we skip the search for it
+  # phase 0: apply structural transforms (provable from AST, no measurement needed)
   candidates = get_kernel_actions(s, include_0=False)
-  tc_candidates = {i: c for i, c in candidates.items() if c.applied_opts and c.applied_opts[-1].op == OptOps.TC}
-  if tc_candidates:
-    for idx, tc_sched in tc_candidates.items():
+  for idx, tc_sched in candidates.items():
+    if tc_sched.applied_opts and tc_sched.applied_opts[-1].op == OptOps.TC:
       _, compiled = _try_compile((idx, tc_sched))
       if compiled is not None:
         s = tc_sched
-        if DEBUG >= 2: print(f"ABDUCT: TC applied {tc_sched.applied_opts[-1]}")
+        if DEBUG >= 2: print(f"ABDUCT: structural {tc_sched.applied_opts[-1]}")
         break
 
   _, compiled_default = _try_compile((0, s))
@@ -82,15 +79,12 @@ def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_ca
     candidates = get_kernel_actions(best, include_0=False)
     if not candidates: break
 
-    # filter by transition graph after depth 0
     if allowed_ops is not None:
       candidates = {i: c for i, c in candidates.items()
                     if c.applied_opts and c.applied_opts[-1].op in allowed_ops}
       if not candidates: break
 
-    # per-depth seen_libs (reset each depth so composite paths aren't suppressed)
     seen_libs: set[bytes] = set()
-    # seed with default lib to prevent no-op candidates from winning by noise
     if compiled_default is not None and len(compiled_default[0].src) > 4:
       default_lib = compiled_default[0].src[4].arg
       if default_lib is not None: seen_libs.add(default_lib)
@@ -113,17 +107,30 @@ def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_ca
 
     if not hypotheses: break
 
-    winner = max(hypotheses, key=lambda h: h.speedup)
+    # e-value trajectory classification: check the speedup distribution shape
+    hypotheses.sort(key=lambda h: h.speedup, reverse=True)
+    winner = hypotheses[0]
+
     if winner.speedup <= 1.01:
-      if DEBUG >= 2: print(f"ABDUCT d{depth}: converged (best hypothesis {winner.speedup:.3f}x)")
+      if DEBUG >= 2: print(f"ABDUCT d{depth}: converged (best {winner.speedup:.3f}x)")
       break
+
+    # phase transition detection: if winner is >10x the runner-up, it's structural — apply without search
+    runner_up = hypotheses[1].speedup if len(hypotheses) > 1 else 1.0
+    is_phase_transition = winner.speedup > 10 * max(runner_up, 1.0)
 
     best = winner.scheduler
     best_time = winner.after
-    allowed_ops = _TRANSITIONS.get(winner.opt.op, {winner.opt.op})
-    if DEBUG >= 2:
-      print(f"ABDUCT d{depth}: {winner.opt} → {winner.after*1e6:.0f}us ({winner.speedup:.2f}x) "
-            f"tried {len(hypotheses)} → follow {[o.name for o in allowed_ops]} {best.colored_shape()}")
+    if is_phase_transition:
+      if DEBUG >= 2:
+        print(f"ABDUCT d{depth}: phase transition {winner.opt} → {winner.after*1e6:.0f}us ({winner.speedup:.2f}x) "
+              f"[{winner.speedup:.0f}x vs runner-up {runner_up:.1f}x] {best.colored_shape()}")
+      allowed_ops = None  # re-open all categories after a phase transition
+    else:
+      allowed_ops = _TRANSITIONS.get(winner.opt.op, {winner.opt.op})
+      if DEBUG >= 2:
+        print(f"ABDUCT d{depth}: {winner.opt} → {winner.after*1e6:.0f}us ({winner.speedup:.2f}x) "
+              f"tried {len(hypotheses)} → follow {[o.name for o in allowed_ops]} {best.colored_shape()}")
 
   # final validation: re-time winner with higher cnt to defeat noise
   if best is not s:
