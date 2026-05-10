@@ -2,8 +2,7 @@ import math, time, traceback, signal
 from dataclasses import replace
 from tinygrad.uop.ops import sym_infer, AxisType, UOp
 from tinygrad.device import Device, Buffer
-from tinygrad.helpers import prod, DEBUG, CACHELEVEL, getenv, Context, unwrap
-from tinygrad.helpers import IGNORE_SEARCH_CACHE
+from tinygrad.helpers import prod, DEBUG, getenv, Context, unwrap
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.tensor import Tensor
 from tinygrad.engine.realize import get_runtime
