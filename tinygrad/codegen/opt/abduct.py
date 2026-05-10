@@ -1,6 +1,6 @@
 """Abduction search: hypothesis-driven kernel optimization.
 
-Alternative to beam_search. Instead of trying all actions (O(actions)),
+Hypothesis-driven kernel optimization. Instead of trying all actions (O(actions)),
 observe the default kernel, perturb one opt at a time, diff the result,
 and follow only the hypotheses that the diff generates.
 

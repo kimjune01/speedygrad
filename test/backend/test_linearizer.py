@@ -153,7 +153,7 @@ class TestLinearizer(unittest.TestCase):
     assert len(stores) == 1
     assert stores[0].src[1].dtype == dtypes.float.vec(4)
 
-  # NOTE: can reenable, it does work. it just makes BEAM slow
+  # NOTE: can reenable, it does work. it just makes SEARCH slow
   @unittest.expectedFailure
   @unittest.skipUnless(Device.DEFAULT == "CPU", "test only for CPU")
   def test_upcast_with_locals_cpu(self):
