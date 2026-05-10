@@ -468,15 +468,15 @@ The real unlock is running the abduction loop on the current machine to get meas
 
 ### New hypotheses (from tiling geometry discussion)
 
-**H: Dimension standardization eliminates tile search.** Pad all reduction dimensions to multiples of 32 (warp size), all matmul dimensions to multiples of TC shape (8 or 16). Overhead is O(surface)/O(volume) — 0.07% at 4096, negligible at LLM scale. If inputs are standardized, the abduction engine's job collapses: find optimal tile for 5 standard shapes, cache forever. Theory transfer dissolves because every instance IS the reference shape.
+**H: Dimension standardization eliminates tile search — PARTIAL KILL.**
 
-Perturbation: auto-pad tensors at construction to next multiple of 32. Measure overhead (memory + wasted compute) vs benefit (fixed kernel templates, no bounds checking, guaranteed alignment).
+Perturbation: online softmax on 1023 vs 1024 columns (same kernel template, different constant). After 50 warmup runs, both converge to 15.7us (p10=15.4 vs 15.9us, 199/200 runs fast). The GPU handles non-aligned dimensions identically. **Killed at the kernel level** — Metal doesn't care about alignment.
 
-Two implementation levels:
-- Tensor-level: `Tensor.__init__` auto-pads, all downstream kernels benefit. Visible to user.
-- Kernel-level: pad inside kernel template, invisible to user but per-kernel complexity.
+**Novel finding: bimodal step function.** GPU kernel latency has two discrete states (~16us or ~66us) with no intermediate values. The step is a Metal pipeline warmup artifact, not an alignment effect. First runs after compilation are slow; subsequent runs are fast. This explains the noisy measurements throughout this session.
 
-Null: padding overhead exceeds the benefit of fixed templates for small tensors (33→64 = 276% waste).
+**Survives at the heuristic level.** tinygrad's `.divides()` checks may choose different (worse) OPT sequences for non-aligned dimensions — not because the GPU is slower, but because the heuristic has fewer valid opt choices. This is the real cost of irregular shapes: not hardware penalty, but heuristic option reduction. The 165 lines of alignment/validity infrastructure exist to work around the heuristic's constraints, not the GPU's.
+
+Implication: padding helps indirectly by giving the heuristic more valid opt choices (e.g., UPCAST by 4 requires dim % 4 == 0). The benefit is heuristic quality, not kernel speed. ~50 lines of `.divides()` guards and PADTO infrastructure could be simplified if dimensions are pre-aligned.
 
 **H: Morton-ordered tile loading for fused dequant.** Interleave quantized weight bytes and scale factors so they share cache lines, rather than loading from separate memory regions. Same principle as GPU texture swizzling — bit-interleaving preserves 2D locality in 1D memory. Perturbation: compare sequential vs Morton-ordered Q6K block loading in the dequant kernel.
 
