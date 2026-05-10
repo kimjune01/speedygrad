@@ -159,6 +159,7 @@ timeout = 300
 timeout_method = "thread"
 timeout_func_only = true
 testpaths = ["test"]
+
 filterwarnings = [
   # Ignore SWIG warnings from importlib
   "ignore:builtin type SwigPy.*has no __module__ attribute:DeprecationWarning",

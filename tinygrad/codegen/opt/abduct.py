@@ -37,7 +37,7 @@ _TRANSITIONS: dict[OptOps, set[OptOps]] = {
 def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_cache=IGNORE_SEARCH_CACHE.value) -> Scheduler:
   """Hypothesis-driven search. O(depth * filtered_actions) trials.
 
-  1. Time the default (heuristic) kernel
+  1. Time the default kernel
   2. Try each available action → keep the best hypothesis
   3. Next depth: only try actions reachable via transition graph from winner
   4. Stop when no hypothesis improves by >1%, or depth exhausted

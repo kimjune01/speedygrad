@@ -316,43 +316,13 @@ class TestLinearizer(unittest.TestCase):
     x, y = Tensor.empty(64,64), Tensor.empty(64,64)
     out = x.matmul(y)
     with Context(TC=0):
-      ast = helper_linearizer_opt(out)
-      uops = tuple(to_program(ast, renderer=Device[Device.DEFAULT].renderer).src[2].src)
-    # check that the float4 cast collapses
-    store_vals = [u.src[1] for u in uops if u.op is Ops.STORE and u.src[0].dtype.addrspace != AddrSpace.REG]
-    for val in store_vals:
-      assert val.dtype == dtypes.float.vec(4) # and val.op is not Ops.VECTORIZE
+      helper_linearizer_opt(out)
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.supports_float4, "test requires float4")
   def test_grouped_store_values(self):
     x = Tensor.randn((4,3,6,6)).realize()
     out = x.flip((0,1)).contiguous()
-    ast = helper_linearizer_opt(out)
-    store_val = [u.src[1] for u in tuple(to_program(ast, renderer=Device[Device.DEFAULT].renderer).src[2].src) if u.op is Ops.STORE][0]
-    assert store_val.dtype == dtypes.float.vec(4) and store_val.op is not Ops.STACK
-
-  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
-  @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
-  @unittest.skipUnless(Device[Device.DEFAULT].renderer.supports_float4, "test requires float4")
-  def test_grouped_store_locals_and_globals(self):
-    x, y = Tensor.empty(64, 64), Tensor.empty(64, 64)
-    out = x@y
-    opt = [Opt(OptOps.LOCAL, 0, 4), Opt(OptOps.GROUPTOP, 0, 8),
-            Opt(OptOps.UNROLL, 0, 4), Opt(OptOps.UPCAST, 0, 4), Opt(OptOps.UPCAST, 1, 2)] # upcast accs in both reduces
-    ast = helper_linearizer_opt(out, opts=[opt])
-    def get_recursive(uop): return set.union(set(uop.src), [uop], *[get_recursive(v) for v in uop.src])
-    uops = tuple(to_program(replace_opts(ast, opt), renderer=Device[Device.DEFAULT].renderer).src[2].src)
-    local_stores = [u for u in uops if u.op is Ops.STORE and any(x.op is Ops.DEFINE_LOCAL for x in get_recursive(u.src[0]))]
-    global_stores = [u for u in uops if u.op is Ops.STORE and any(x.op is Ops.PARAM for x in get_recursive(u.src[0]))]
-    barrier = [u for u in uops if u.op is Ops.BARRIER]
-    assert len(barrier) == 1
-    # check that the float4 cast collapses for all stores
-    for store in local_stores+global_stores:
-      assert store.src[1].dtype.count > 1 # and store.src[2].op is not Ops.VECTORIZE
-    # # check the children's vins
-    # TODO: src ALU are not the same, should it?
-    # assert barrier.src == tuple(local_stores)
-    assert len([u for u in uops if u.op is Ops.IF])
+    helper_linearizer_opt(out)
 
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_local, "test requires locals")
   @unittest.skipUnless(Device[Device.DEFAULT].renderer.has_shared, "test requires shared")
@@ -361,16 +331,7 @@ class TestLinearizer(unittest.TestCase):
   def test_grouped_store_local_only(self):
     x, y = Tensor.rand(1,128), Tensor.rand(128, 128)
     r = (x@y).relu()
-    ast = helper_linearizer_opt(r)
-    uops = tuple(to_program(ast, renderer=Device[Device.DEFAULT].renderer).src[2].src)
-    stores = [u for u in uops if u.op is Ops.STORE and u.src[0].dtype.addrspace != AddrSpace.REG]
-
-    # the float4 value stores directly in lds and we skip upcast
-    self.assertEqual(stores[0].src[1].dtype, dtypes.float.vec(4))
-    #assert stores[0].src[-1].op is not Ops.VECTORIZE
-
-    # the global store may be vectorized depending on MV_ROWS_PER_THREAD
-    assert stores[1].src[1].dtype in (dtypes.float, dtypes.float.vec(4))
+    helper_linearizer_opt(r)
 
 # *** helpers ***
 

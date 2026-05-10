@@ -1,4 +1,4 @@
-# opt opinionatedly transforms an ast into an optimized ast using either heuristics or beam search
+# opt transforms an ast into an optimized ast using abduction search
 from __future__ import annotations
 from enum import Enum, auto
 from dataclasses import dataclass

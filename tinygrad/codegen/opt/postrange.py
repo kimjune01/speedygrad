@@ -311,7 +311,7 @@ class Scheduler:
           return axes
     return None
 
-  # helpers for hand_coded_optimizations
+  # helpers for abduction search
   @property
   def reduceops(self) -> list[UOp]: return [x for x in self.ast.backward_slice if x.op is Ops.REDUCE]
   @property
@@ -338,14 +338,10 @@ def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
   k.convert_loop_to_global()
   if ast.arg is not None and ast.arg.opts_to_apply is not None:
     for opt in ast.arg.opts_to_apply: k.apply_opt(opt)
-  elif beam >= 1:
-    from tinygrad.codegen.opt.abduct import abduct_search
-    rawbufs = bufs_from_ast(ast, ren.target.device)
-    with Context(ALLOW_DEVICE_USAGE=1):
-      k = abduct_search(k, rawbufs, max_depth=beam)
-  elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
-    from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
-    # NOTE: hand_coded_optimizations doesn't support multiblock opts yet
+  elif beam >= 1 and not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
     if not any(u.op is Ops.BUFFERIZE for u in ast.backward_slice):
-      k = hand_coded_optimizations(k)
+      from tinygrad.codegen.opt.abduct import abduct_search
+      rawbufs = bufs_from_ast(ast, ren.target.device)
+      with Context(ALLOW_DEVICE_USAGE=1):
+        k = abduct_search(k, rawbufs, max_depth=beam)
   return k.get_optimized_ast(name_override=ast.arg.name if ast.arg is not None and ast.arg.name != "test" else None)
