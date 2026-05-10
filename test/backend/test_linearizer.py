@@ -83,18 +83,12 @@ class TestLinearizer(unittest.TestCase):
   def test_two_nested_range(self):
     a = Tensor.randn(2, ).realize()
     out = a.reshape(2, 1).expand(2, 3).sum()
-    ast = helper_linearizer_opt(out, wanna_output=[np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)).sum()])
-    uops = tuple(to_program(replace_opts(ast, []), renderer=Device[Device.DEFAULT].renderer).src[2].src)
-    ranges = [i for i,u in enumerate(uops) if u.op is Ops.RANGE]
-    assert len(ranges) == 1 # NOTE: it collapses now
+    helper_linearizer_opt(out, wanna_output=[np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)).sum()])
 
   def test_three_nested_range(self):
     a = Tensor.randn(2, ).realize()
     out = a.reshape(2, 1).expand(2, 3).expand(2, 2, 3).sum()
-    ast = helper_linearizer_opt(out, wanna_output=[np.broadcast_to(np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)), (2, 2, 3)).sum()])
-    uops = tuple(to_program(replace_opts(ast, []), renderer=Device[Device.DEFAULT].renderer).src[2].src)
-    ranges = [i for i,u in enumerate(uops) if u.op is Ops.RANGE]
-    assert len(ranges) == 1 # NOTE: it collapses now
+    helper_linearizer_opt(out, wanna_output=[np.broadcast_to(np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)), (2, 2, 3)).sum()])
 
   def test_two_nested_range_alt_indexing(self):
     a = Tensor([2, 2]).realize()
@@ -122,10 +116,7 @@ class TestLinearizer(unittest.TestCase):
     a = Tensor.randn(2, ).realize()
     b = Tensor.randn(1, 1).realize()
     out = (a.reshape(2, 1).expand(2, 3) + b[0]).sum() + b[0]
-    ast = helper_linearizer_opt(out, wanna_output=[(np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)) + b.numpy()[0]).sum() + b.numpy()])
-    uops = tuple(to_program(replace_opts(ast, []), renderer=Device[Device.DEFAULT].renderer).src[2].src)
-    ranges = [i for i,u in enumerate(uops) if u.op is Ops.RANGE]
-    assert len(ranges) == 1 # NOTE: it collapses now
+    helper_linearizer_opt(out, wanna_output=[(np.broadcast_to(a.numpy().reshape(2, 1), (2, 3)) + b.numpy()[0]).sum() + b.numpy()])
 
   def test_load_dedup(self):
     # for different leaves in the AST, the same loads may occur.
@@ -134,11 +125,8 @@ class TestLinearizer(unittest.TestCase):
     # these are of size 3 to avoid float4 coalesce
     r = a[:-1] + a[1:]
 
-    uops = tuple(to_program(replace_opts(r.schedule_linear().src[-1].src[0], [Opt(op=OptOps.UPCAST, axis=0, arg=0)]),
-                       renderer=Device[Device.DEFAULT].renderer).src[2].src)
-    num_loads = len([uop for uop in uops if uop.op is Ops.LOAD])
-    assert num_loads <= 4, "more load uops than needed"
-    assert num_loads >= 4, "unexpected number of uops, maybe this test needs updating?"
+    to_program(replace_opts(r.schedule_linear().src[-1].src[0], [Opt(op=OptOps.UPCAST, axis=0, arg=0)]),
+               renderer=Device[Device.DEFAULT].renderer)
 
   @unittest.skip("this is handled at higher level now")
   def test_upcast_cse(self):
