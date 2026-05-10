@@ -1,2 +1,2 @@
 import os
-os.environ.setdefault("SEARCH", "1")
+os.environ.setdefault("SEARCH", "0")

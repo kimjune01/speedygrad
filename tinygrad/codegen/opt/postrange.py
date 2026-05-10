@@ -338,10 +338,17 @@ def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
   k.convert_loop_to_global()
   if ast.arg is not None and ast.arg.opts_to_apply is not None:
     for opt in ast.arg.opts_to_apply: k.apply_opt(opt)
-  elif beam >= 1 and not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
+  elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
     if not any(u.op is Ops.BUFFERIZE for u in ast.backward_slice):
-      from tinygrad.codegen.opt.abduct import abduct_search
-      rawbufs = bufs_from_ast(ast, ren.target.device)
-      with Context(ALLOW_DEVICE_USAGE=1):
-        k = abduct_search(k, rawbufs, max_depth=beam)
+      if beam >= 1:
+        from tinygrad.codegen.opt.abduct import abduct_search
+        rawbufs = bufs_from_ast(ast, ren.target.device)
+        with Context(ALLOW_DEVICE_USAGE=1):
+          k = abduct_search(k, rawbufs, max_depth=beam)
+      elif ren.has_local and k.reduceop is not None:
+        for axis in range(min(3, k.shape_len)):
+          try:
+            k.apply_opt(Opt(OptOps.GROUPTOP, axis, 32))
+            break
+          except KernelOptError: pass
   return k.get_optimized_ast(name_override=ast.arg.name if ast.arg is not None and ast.arg.name != "test" else None)
