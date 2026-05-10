@@ -12,9 +12,7 @@ the perturbation was applied, and it changed performance by X."
 from tinygrad import Tensor, Device
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
 from tinygrad.codegen.opt.search import get_kernel_actions
-from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
 from tinygrad.codegen.opt.postrange import Scheduler
-from tinygrad.codegen import to_program
 from tinygrad.uop.ops import Ops, UOp
 from dataclasses import dataclass
 
@@ -26,19 +24,15 @@ class Hypothesis:
     perturbation: str    # what was poked
 
 def get_opts(t: Tensor) -> list[tuple[str, list[Opt]]]:
-    """Extract the heuristic's opt choices for each kernel in t's schedule."""
+    """Extract the applied opt choices for each kernel in t's schedule."""
     linear = t.schedule_linear()
     results = []
     for call in linear.src:
         ast = call.src[0]
         if ast.op is Ops.SINK:
-            # run the heuristic
             ren = Device.default.renderer
             k = Scheduler(ast, ren)
-            try:
-                k = hand_coded_optimizations(k)
-            except Exception:
-                pass
+            k.convert_loop_to_global()
             results.append((str(ast.arg), list(k.applied_opts)))
     return results
 
