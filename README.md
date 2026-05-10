@@ -44,6 +44,8 @@ Net: **-148 lines** across `tinygrad/` and `test/` (+300, -448) vs upstream at f
 
 ## Setup
 
+Requires Python >=3.11.
+
 ```bash
 git clone https://github.com/kimjune01/speedygrad.git
 cd speedygrad
