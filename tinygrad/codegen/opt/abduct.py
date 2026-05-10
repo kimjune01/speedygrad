@@ -107,30 +107,17 @@ def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_ca
 
     if not hypotheses: break
 
-    # e-value trajectory classification: check the speedup distribution shape
-    hypotheses.sort(key=lambda h: h.speedup, reverse=True)
-    winner = hypotheses[0]
-
+    winner = max(hypotheses, key=lambda h: h.speedup)
     if winner.speedup <= 1.01:
-      if DEBUG >= 2: print(f"ABDUCT d{depth}: converged (best {winner.speedup:.3f}x)")
+      if DEBUG >= 2: print(f"ABDUCT d{depth}: converged (best hypothesis {winner.speedup:.3f}x)")
       break
-
-    # phase transition detection: if winner is >10x the runner-up, it's structural — apply without search
-    runner_up = hypotheses[1].speedup if len(hypotheses) > 1 else 1.0
-    is_phase_transition = winner.speedup > 10 * max(runner_up, 1.0)
 
     best = winner.scheduler
     best_time = winner.after
-    if is_phase_transition:
-      if DEBUG >= 2:
-        print(f"ABDUCT d{depth}: phase transition {winner.opt} → {winner.after*1e6:.0f}us ({winner.speedup:.2f}x) "
-              f"[{winner.speedup:.0f}x vs runner-up {runner_up:.1f}x] {best.colored_shape()}")
-      allowed_ops = None  # re-open all categories after a phase transition
-    else:
-      allowed_ops = _TRANSITIONS.get(winner.opt.op, {winner.opt.op})
-      if DEBUG >= 2:
-        print(f"ABDUCT d{depth}: {winner.opt} → {winner.after*1e6:.0f}us ({winner.speedup:.2f}x) "
-              f"tried {len(hypotheses)} → follow {[o.name for o in allowed_ops]} {best.colored_shape()}")
+    allowed_ops = _TRANSITIONS.get(winner.opt.op, {winner.opt.op})
+    if DEBUG >= 2:
+      print(f"ABDUCT d{depth}: {winner.opt} → {winner.after*1e6:.0f}us ({winner.speedup:.2f}x) "
+            f"tried {len(hypotheses)} → follow {[o.name for o in allowed_ops]} {best.colored_shape()}")
 
   # final validation: re-time winner with higher cnt to defeat noise
   if best is not s:

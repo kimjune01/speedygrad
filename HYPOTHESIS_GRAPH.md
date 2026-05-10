@@ -448,6 +448,10 @@ Ranked by impact per line of code. Tiebreaker: fewer lines wins.
 - ~~Dimension standardization~~ — shipped as universal padder in `_reduce`
 - ~~CPython JIT improvement~~ — out of scope
 
+### Killed this session
+- ~~E-value trajectory classification~~ — phase transition detection (winner >10x runner-up → re-open categories) increased trials 6% (568→602) without reducing convergence depth. The re-opening adds breadth that offsets faster convergence. Diagnostically correct (TC correctly identified as structural) but net negative on trial count. Reverted. TC fast-path kept as structural deduction (provable from AST).
+- ~~GROUPTOP=64 universal~~ — oscillatory: helps large dims (4096, -4%), hurts small dims (1024, +17%). Optimal GROUPTOP depends on reduction size. The abduction engine finds the right value per kernel.
+
 ### PADTO removal — BLOCKED on TC padding
 
 PADTO infrastructure (16 lines in postrange + OptOps definition) is still used by tensor core padding (`postrange.py:258`): `apply_opt(Opt(OptOps.PADTO, idx, tc.dims[i]))`. TC pads M/N/K axes to multiples of TC tile dimensions (8, 16).
