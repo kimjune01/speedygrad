@@ -482,7 +482,22 @@ Perturbation: online softmax on 1023 vs 1024 columns (same kernel template, diff
 
 Pad-compute-truncate (4093→4096, pad with -inf, shrink output) recovers 92% of aligned performance (212us) with exact correctness (diff=1.86e-09). The 9.2x speedup comes entirely from the heuristic's `.divides()` guard unlocking GROUPTOP=32.
 
-This is the largest single finding of the session. The GPU hardware is neutral (p10 identical for 4093 vs 4096 in raw kernel benchmarks). The ENTIRE 9.2x comes from the heuristic choosing a different kernel structure. ~50 lines of `.divides()` guards and PADTO infrastructure could be replaced by a 1-line auto-padder at the Tensor API level.
+This is the largest single finding of the session. The GPU hardware is neutral (p10 identical for 4093 vs 4096 in raw kernel benchmarks). The ENTIRE 9.2x comes from the heuristic choosing a different kernel structure.
+
+**Auto-padder shipped for softmax + log_softmax.** 21 lines, 6.8x on dim=4093. Codex-reviewed (4 edge cases fixed: 0-D, float16, axis=None, symbolic dims).
+
+**GROUPTOP cliff is universal.** Every reduction op (sum, max, mean, var, std, logsumexp, argmax) produces 0 GROUPTOP kernels at dim=4093 vs 1-2 at dim=4096. Pad-safe ops that could use the same pattern:
+
+| Op | Pad value | Safe? | Notes |
+|---|---|---|---|
+| logsumexp | -inf | yes | exp(-inf)=0 |
+| max | -inf | yes | doesn't affect max |
+| sum | 0 | yes | doesn't affect sum |
+| mean | — | NO | zeros shift mean |
+| var/std | — | NO | zeros shift variance |
+| argmax | -inf | partial | output index may point to padded position |
+
+Line reduction blocked until padder covers all safe ops. PADTO infrastructure (16 lines) and `.divides()` guards (17 lines) serve non-padded ops and TC padding.
 
 **H: Morton-ordered tile loading for fused dequant.** Interleave quantized weight bytes and scale factors so they share cache lines, rather than loading from separate memory regions. Same principle as GPU texture swizzling — bit-interleaving preserves 2D locality in 1D memory. Perturbation: compare sequential vs Morton-ordered Q6K block loading in the dequant kernel.
 
