@@ -434,11 +434,18 @@ Ranked by impact per line of code. Tiebreaker: fewer lines wins.
 
 | # | Edge | LOC | Status |
 |---|---|---|---|
-| 1 | Algebraic fusion (online softmax framework integration) | ~100 | prototype validated (2.5-6.6x), needs UOp wiring |
-| 2 | PADTO removal (extend universal padder to TC dimensions) | -16 | blocks on TC axis padding |
+| 1 | Matvec codegen: loop reordering for stride-32768 | ~20 | diagnosed — search space collapse at N=1, fix is codegen-level |
+| 2 | Algebraic fusion (online softmax framework integration) | ~100 | prototype validated (2.5-6.6x), needs UOp wiring |
 | 3 | Native Q6K matmul kernels | ~300 | open |
 | 4 | Fused dequant UOp rewrite | ~200 | depends on #3 |
-| 5 | BEAM_* env var rename to SEARCH_* | ~0 | tedious, low priority |
+
+### Matvec gap (2.27x vs PyTorch) — DIAGNOSED
+
+Abduction engine diagnosis: the matvec kernel has 1 LOCAL + 1 UPCAST action (vs 9+5 for gemm). The N=1 dimension collapses the optimization surface — the abduction engine has nothing to search over. PyTorch dispatches to a hand-written Metal matvec kernel.
+
+The root cause (from the original matvec investigation, section III): the generated kernel walks the weight matrix with stride 32768 bytes in the inner loop. Unit-stride output axis is outside the loop. The fix is codegen-level (loop reordering or specialized matvec kernel template), not search-level.
+
+Transposed weight abduction: transposing the weight matrix LOSES TC, GROUPTOP, GROUP, and UNROLL entirely. The stride pattern makes the kernel unrecognizable as a matmul pattern.
 
 ### Closed this session
 - ~~Theory transfer to non-matmul~~ — superseded by abduction engine (measures per-kernel, no transfer needed)
