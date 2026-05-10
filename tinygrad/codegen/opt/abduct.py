@@ -94,8 +94,8 @@ def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_ca
       try:
         tms = _time_program(compiled[0], var_vals, rawbufs, early_stop=early_stop_margin, cnt=3)
         t = min(tms)
-      except RuntimeError: continue
-      hypotheses.append(Hypothesis(scheduler=candidate, opt=candidate.applied_opts[-1],
+      except (RuntimeError, AssertionError): continue
+      hypotheses.append(Hypothesis(scheduler=candidate, opt=candidate.applied_opts[-1],  # always non-empty via include_0=False
                                    after=t, speedup=best_time / t if t > 0 else 0))
 
     if not hypotheses: break
