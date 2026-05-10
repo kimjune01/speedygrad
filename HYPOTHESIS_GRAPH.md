@@ -648,14 +648,43 @@ H_REFRAME confirmed: matvec frontier was Metal-specific, real CUDA gap is gemm
                     measured-faster, then deepen to 5 from TC starting point
 ```
 
-### Open frontier (after this iteration)
+### Iteration history (this session, depths 2-4)
 
-| # | Edge | Status |
-|---|---|---|
-| 1 | Search nondeterminism (sum_4096 oscillates 52us↔603us across runs) | known, out of scope; needs deterministic timing protocol (clear_l2, CUDA events) |
-| 2 | Small-op host overhead (~30us floor on add/relu/exp vs torch's ~25us) | known, Section II |
-| 3 | First-compile cost (~5s for gemm_256 with depth-5 search) | tradeoff for kernel quality; cached after |
-| 4 | gemm_1024 still 1.07x off torch (8% gap) | residual; likely cuBLAS micro-tuning we can't match without WMMA fragment patterns |
+**Iter 2 (commit fb80c5c87):** ALLOW_TF32 default + abduct cache key + measurement-gated TC late sweep. Closed gemm_1024 5.0x → 1.07x.
+
+**Iter 3 (commit b025476de):** top-3 re-validation per depth in abduction search. Same depth, same workload, but cnt=3 was 17% likely to pick a no-op-ish opt (UNROLL(0,0)) under noise. gemm_256 lost a 6/6 → 8/8 stability check; gemm_1024 reached 0.97x (now winning torch). Direct evidence in `prework/cuda-parity/noise_probe.py` — 8 fresh runs of gemm_256 land in 53-63us where iter 2 had a 1/6 outlier at 106us.
+
+**Iter 4 (commit 7240da8d9):** direct dispatch in `run_linear`'s per-call exec loop, replacing `pm_exec.rewrite()` 6-pattern probe with a dict lookup. Saved 65us cumtime per call (73% of small-op JIT replay cost). matvec 115→99us, softmax 43→36us, layernorm 44→36us, exp_2048 59→49us.
+
+**Iter 5 attempted (reverted):** single-device fast path in `exec_kernel` (skip `unwrap_multi` generator) and JIT-replay short-circuit in `track_stats`. Both were measured to give <2us savings — below `Device.synchronize()`'s 15us round-trip noise floor. Code reverted; the wall-time gap on add/relu/exp is structural — Python + ctypes overhead per CUDA driver call has ~30us floor on Windows. Closing further requires Cython exec_kernel or CUDA graphs (multi-call batching), both substantial.
+
+### Final scorecard (RTX 4080, Windows, p10 of 50 trials, isolated subprocess)
+
+| Workload | initial baseline | iter 2 | iter 3 | iter 4 | torch | final result |
+|---|---|---|---|---|---|---|
+| gemm_1024 | 545 | 122 | 118 | 121 | 122 | **WIN 0.98x** |
+| gemm_256 | 99 | 54 | 53 | 50 | 45 | near 1.10x |
+| add_4096 | 67 | 53 | 51 | 51 | 23 | 2.25x (host floor) |
+| mul_sum | 80 | 36 | 34 | 32 | 57 | **WIN 0.55x** |
+| relu_4096 | 60 | 48 | 49 | 47 | 24 | 1.94x (host floor) |
+| exp_2048 | 60 | 51 | 59 | 47 | 21 | 2.21x (host floor) |
+| sum_4096 | 80 | 52 | 51 | 46 | 32 | 1.43x |
+| permute | 62 | 51 | 52 | 49 | 39 | near 1.25x |
+| softmax | 65 | 39 | 43 | 35 | 21 | 1.66x |
+| layernorm | 64 | 43 | 44 | 32 | 42 | **WIN 0.76x** |
+| matvec | 84 | 108 | 115 | 98 | 63-141 (noisy) | wins p50, ties p10 |
+
+3 wins, 2 near-parity, 4 modest gaps, 3 host-floor gaps. From ~9/11 with material gaps (4 of them ≥3x) at iteration 1 to 4/11 still with material gaps now.
+
+### Open frontier (after exhaustion this session)
+
+| # | Edge | LOC | Status |
+|---|---|---|---|
+| 1 | Cython exec_kernel + ctypes wrapper | ~200 | not attempted; structural |
+| 2 | CUDA graph batching for repeated kernels | ~150 | not attempted; structural |
+| 3 | First-compile cost (~5s for gemm_256 at depth 5) | ~30 | tradeoff for kernel quality |
+| 4 | matvec p90 occasional 234us (1/10) — late TC sweep occasionally finds bad TC kernel | ~10 | needs separate root-cause |
+| 5 | Search nondeterminism in cached kernel selection | ~50 | partly addressed (top-3 re-val), residual remains |
 
 ---
 
