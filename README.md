@@ -2,7 +2,7 @@
 
 AGPL-3.0 fork of [tinygrad](https://github.com/tinygrad/tinygrad). Measurement-driven kernel optimization replaces hand-tuned heuristics.
 
-## vs PyTorch (Metal, fp32, TinyJit warm)
+## vs PyTorch (Metal, M-series, fp32, TinyJit warm, p50 of 50 trials)
 
 | op | PyTorch | speedygrad | | was (tinygrad) |
 |---|---|---|---|---|
@@ -17,36 +17,36 @@ AGPL-3.0 fork of [tinygrad](https://github.com/tinygrad/tinygrad). Measurement-d
 | gemm\_1024 | 340us | 559us | 1.64x | 1.8x |
 | matvec | 530us | 1204us | 2.27x | 3.0x |
 
+Shapes: N=1024 for gemm/mul\_sum, 256 for gemm\_256/softmax/layernorm/permute, 4096 for add/relu/sum, 4096x4096 for matvec. Wall-clock time including Metal dispatch. "was" column from the [realize investigation](HYPOTHESIS_GRAPH.md) on upstream tinygrad.
+
 ## What changed
 
-**Abduction engine** replaces the heuristic and BEAM search. Two samples, one diff, the shape of the failure names the next experiment. `SEARCH=3` by default — 62% faster kernels than the heuristic, 32 trials per kernel, cached after first run.
+**Abduction engine** replaces the heuristic and BEAM search. Hypothesis-driven: try candidates, keep the best, follow the winner's category at the next depth. `SEARCH=3` by default. Usually finds faster kernels than the heuristic when search budget is acceptable (~20 trials/kernel avg, cached after first run).
 
-**Universal reduction padder** in `_reduce` — pads to multiples of 32 so GROUPTOP fires on every reduction. Eliminates 9.2x performance cliffs on misaligned dimensions. 5 lines.
+**Reduction padding** in `_reduce` — pads single-axis MAX/ADD reductions with static misaligned dimensions to multiples of 32 so GROUPTOP fires. Eliminates performance cliffs on non-32-divisible reduction axes.
 
 **Warp-reduce activation** — GROUPTOP=32 + `simd_sum`/`simd_max` replaces shared-memory reduction. 3.5x on max reduction kernels.
 
-**Matmul TC padding** — pads M/K/N to tensor core tile multiples at the Tensor API. TC fires on misaligned matmul (253×251) via structural deduction.
+**Matmul TC padding** — pads matmul axes to multiples of 8 at the Tensor API so tensor cores can apply on misaligned shapes.
 
-**Cython schedule path** — `unified_rewrite`, `rewrite`, `toposort`, `dfs_match` compiled to C. 55% faster schedule (3.46s → 1.57s on ResNet50).
+**Cython schedule path** — `unified_rewrite`, `rewrite`, `toposort`, `dfs_match` compiled to C. ~50% faster schedule (3.46s → 1.75s on ResNet50, 20 kernels).
 
 **Ported work** — [Sou-ly's](https://github.com/Sou-ly) toposort→dfs\_match optimization ([tinygrad #15491](https://github.com/tinygrad/tinygrad/pull/15491)), with attribution and push access.
 
 ## What was removed
 
-- `hand_coded_optimizations` (190 lines) — replaced by abduction engine (90 lines)
-- `beam_search` (99 lines) — strictly dominated by abduction
-- `OptOps.PADTO` (16 lines) — replaced by Tensor-level matmul padding
-- Structure test assertions (55 lines) — blocked optimization without proving correctness
-
-Net: **-148 lines** vs upstream tinygrad's optimization code.
+- `hand_coded_optimizations` — replaced by abduction engine
+- `beam_search` — replaced by abduction engine
+- `OptOps.PADTO` — replaced by Tensor-level padding
+- Structure test assertions — blocked optimization without proving correctness
 
 ## How to use
 
 ```bash
-# default: abduction search finds optimal kernel opts
+# default: abduction search (SEARCH=3)
 python3 my_model.py
 
-# fast mode (GROUPTOP=32 stub only, no search)
+# fast mode: GROUPTOP=32 stub only, no search
 SEARCH=0 python3 my_model.py
 
 # with Cython schedule speedup
