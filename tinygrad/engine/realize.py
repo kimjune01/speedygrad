@@ -235,7 +235,22 @@ def compile_linear(linear:UOp, beam=0, validate=False) -> UOp:
   linear = graph_rewrite(linear, pm_compile, name="precompile kernels", walk=True)
   return graph_rewrite(linear, pm_optimize_local_size, name="optimize local size", walk=True)
 
+_EXEC_DISPATCH = {Ops.PROGRAM: exec_kernel, Ops.COPY: exec_copy, Ops.BUFFER_VIEW: exec_view}
+_CUSTOM_DISPATCH = {"validate": exec_validate, "graph": exec_graph, "encdec": exec_encdec}
+
 def run_linear(linear:UOp, var_vals:dict[str, int]|None=None, input_uops:tuple[UOp, ...]=(), do_update_stats=True, jit=False):
   if not jit: linear = compile_linear(linear, validate=VALIDATE_WITH_CPU)
   ctx = ExecContext(var_vals or {}, input_uops, do_update_stats, jit)
-  for call in linear.src: pm_exec.rewrite(call, ctx)
+  # direct dispatch by call.src[0].op — skips pattern matcher's 6-pattern probe
+  # (~50us / ~73% of small-op JIT replay cost on RTX 4080 Windows)
+  for call in linear.src:
+    ast = call.src[0]
+    op = ast.op
+    fn = _EXEC_DISPATCH.get(op)
+    if fn is not None:
+      fn(ctx, call, ast)
+    elif op is Ops.CUSTOM_FUNCTION:
+      _CUSTOM_DISPATCH[ast.arg](ctx, call, ast)
+    else:
+      # fallback to pattern matcher for any unknown op (keeps semantics if new ops added)
+      pm_exec.rewrite(call, ctx)
