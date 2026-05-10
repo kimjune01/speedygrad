@@ -339,14 +339,10 @@ def apply_opts(ast:UOp, ren:Renderer, beam:int=0) -> UOp:
   if ast.arg is not None and ast.arg.opts_to_apply is not None:
     for opt in ast.arg.opts_to_apply: k.apply_opt(opt)
   elif beam >= 1:
+    from tinygrad.codegen.opt.abduct import abduct_search
     rawbufs = bufs_from_ast(ast, ren.target.device)
     with Context(ALLOW_DEVICE_USAGE=1):
-      if getenv("ABDUCT"):
-        from tinygrad.codegen.opt.abduct import abduct_search
-        k = abduct_search(k, rawbufs, max_depth=getenv("ABDUCT", 3))
-      else:
-        from tinygrad.codegen.opt.search import beam_search
-        k = beam_search(k, rawbufs, beam, bool(getenv("BEAM_ESTIMATE", 1)))
+      k = abduct_search(k, rawbufs, max_depth=beam)
   elif not NOOPT and (ast.arg is None or ast.arg.applied_opts == ()):
     from tinygrad.codegen.opt.heuristic import hand_coded_optimizations
     # NOTE: hand_coded_optimizations doesn't support multiblock opts yet
