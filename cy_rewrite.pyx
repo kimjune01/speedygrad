@@ -6,6 +6,36 @@ from tinygrad.uop.ops import UOp, Ops, unwrap, BottomUpGate
 cdef object SENTINEL = object()
 cdef set CALL_OPS = {Ops.CALL, Ops.FUNCTION}
 
+def cy_toposort(self, gate=None, bint enter_calls=True):
+    """Cython-compiled UOp.toposort — typed stack/dict operations."""
+    cdef dict cache = {}
+    cdef list stack = [(self, False)]
+    cdef bint visited
+    while stack:
+        node, visited = stack.pop()
+        if node in cache: continue
+        if not visited:
+            if gate is None or gate(node):
+                stack.append((node, True))
+                srcs = node.src if enter_calls or node.op not in CALL_OPS else node.src[1:]
+                for s in reversed(srcs):
+                    stack.append((s, False))
+        else:
+            cache[node] = None
+    return cache
+
+def cy_dfs_match(self, match, gate=None):
+    """Cython-compiled UOp.dfs_match — typed short-circuit DFS."""
+    cdef set seen = set()
+    cdef list stack = [self]
+    while stack:
+        node = stack.pop()
+        if node in seen: continue
+        seen.add(node)
+        if match(node): return True
+        if gate is None or gate(node): stack.extend(node.src)
+    return False
+
 def cy_rewrite(self, uop, ctx=None):
     """Cython-compiled PatternMatcher.rewrite — bitmask early-reject + move-toward-front on hit."""
     cdef list pats = self._plist[uop.op]
