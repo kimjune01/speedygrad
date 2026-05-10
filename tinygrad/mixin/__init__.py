@@ -345,6 +345,17 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     w = w.reshape(*w.shape[0:-2], *[1]*min(dx-1, dw-1, 1), *w.shape[axis_w:]).transpose(-1, axis_w)
     return (x*w).sum(-1, dtype=dtype).cast(least_upper_dtype(x.dtype, w.dtype) if dtype is None else to_dtype(dtype))
 
+  def _pad_to_tc(self, axis:int, tile:int=8) -> tuple[Self, int|None]:
+    """Pad an axis to the next multiple of tile for tensor core alignment."""
+    if self.ndim < 2 or not isinstance(axis, int): return self, None
+    ax = self._resolve_dim(axis)
+    dim = self.shape[ax]
+    if not isinstance(dim, int) or dim % tile == 0: return self, None
+    padded = ((dim + tile - 1) // tile) * tile
+    pad_width = [(0,0)] * self.ndim
+    pad_width[ax] = (0, padded - dim)
+    return self.pad(pad_width, value=0.0), dim
+
   def matmul(self, x:Self, reverse=False, dtype:DTypeLike|None=None) -> Self:
     """
     Performs matrix multiplication between two tensors.
@@ -358,7 +369,17 @@ class OpMixin(ElementwiseMixin, ReduceMixin):
     print(a.matmul(b).numpy())
     ```
     """
-    return x.dot(self, dtype=dtype) if reverse else self.dot(x, dtype=dtype)
+    a, b = (x, self) if reverse else (self, x)
+    if a.ndim >= 2 and b.ndim >= 2:
+      a, orig_m = a._pad_to_tc(-2)
+      a, orig_k = a._pad_to_tc(-1)
+      b, _ = b._pad_to_tc(-2)
+      b, orig_n = b._pad_to_tc(-1)
+      out = a.dot(b, dtype=dtype)
+      if orig_m is not None: out = out.shrink(tuple((0, s) for s in out.shape[:-2]) + ((0, orig_m),) + ((0, out.shape[-1]),))
+      if orig_n is not None: out = out.shrink(tuple((0, s) for s in out.shape[:-1]) + ((0, orig_n),))
+      return out
+    return a.dot(b, dtype=dtype)
 
   def __matmul__(self, x:Self) -> Self: return self.matmul(x)
   def __rmatmul__(self, x:Self) -> Self: return self.matmul(x, True)

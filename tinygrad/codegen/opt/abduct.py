@@ -31,7 +31,6 @@ _TRANSITIONS: dict[OptOps, set[OptOps]] = {
   OptOps.GROUP:    {OptOps.GROUP, OptOps.LOCAL, OptOps.UPCAST},
   OptOps.TC:       {OptOps.UPCAST, OptOps.LOCAL, OptOps.UNROLL},
   OptOps.SWAP:     {OptOps.SWAP, OptOps.LOCAL, OptOps.UPCAST},
-  OptOps.PADTO:    {OptOps.PADTO, OptOps.UPCAST, OptOps.LOCAL},
 }
 
 def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_cache=IGNORE_SEARCH_CACHE.value) -> Scheduler:

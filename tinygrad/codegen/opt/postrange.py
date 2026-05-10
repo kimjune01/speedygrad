@@ -145,7 +145,7 @@ class Scheduler:
 
       # copied from kernel.py. prevents METAL compiler hangs
       if self.reduceop is not None and (opt.op in {OptOps.GROUP, OptOps.GROUPTOP} or \
-                                        (self.group_for_reduces and opt.op not in {OptOps.NOLOCALS, OptOps.PADTO})):
+                                        (self.group_for_reduces and opt.op is not OptOps.NOLOCALS)):
         upcast_local_sz = prod([self.full_shape[a] for a in self.axes_of(AxisType.UPCAST, AxisType.WARP, AxisType.LOCAL, AxisType.GROUP_REDUCE)])
         smem_sz = amt*upcast_local_sz*self.reduceop.dtype.itemsize
         check(smem_sz <= self.ren.shared_max, f"exceeds maximum shared memory size: needs {smem_sz}, max {self.ren.shared_max}")
@@ -184,22 +184,6 @@ class Scheduler:
       try: ret = self._apply_tc_opt(use_tensor_cores, cast(int, opt.axis), tc_select, tc_opt)
       except ValueError as e: raise KernelOptError(str(e))
       check(ret is not None, "no tensor core available")
-    elif opt.op is OptOps.PADTO:
-      check(rng.src[0].op is Ops.CONST, "only pad const axes")
-      check(rng.arg[-1] not in {AxisType.UPCAST, AxisType.UNROLL}, "cannot pad upcasted") # TODO: why is this wrong?
-      check(rng.arg[-1] is not AxisType.THREAD, "cannot pad thread")
-      # ok to pad SUM if all parent ALU ops have f(0) = 0
-      if (r:=self.reduceop) is not None and rng.arg[-1] in (AxisType.GROUP_REDUCE, AxisType.REDUCE):
-        check(r.arg[0] is Ops.ADD and not r.op_in_backward_slice_with_self(*GroupOp.UnsafePad), f"cannot pad {r}")
-      new_sz = round_up(int(rng.vmax+1), cast(int, opt.arg))
-      check(rng.vmax+1 > new_sz//4, "pad adds more than quadruple the work")
-      replaced_rng = UOp.range(new_sz, *rng.arg)
-      replaces = {rng:replaced_rng}
-      valid = replaced_rng < rng.vmax+1
-      for b in self.bufs:
-        if rng in (i:=b.src[1].get_idx()).backward_slice_with_self:
-          replaces[b] = b.replace(src=(b.src[0],(valid&b.src[1].get_valid()).where(i, UOp.invalid())))
-      self.ast = self.ast.substitute(replaces, f"padto {rng.arg[:-1]} {opt.arg}")
     elif opt.op is OptOps.SWAP:
       try:
         altrng:UOp = self.rngs[opt.arg]
@@ -251,12 +235,8 @@ class Scheduler:
           # do optimizations and save the ranges
           try:
             for i,a in enumerate(axes):
-              idx = self.rngs.index(a)
               if (a.vmax+1) % tc.dims[i] != 0:
-                if opt_level < 2: raise KernelOptError("tc padding requires opt_level >= 2")
-                # apply_opt should return the updated range?
-                self.apply_opt(Opt(OptOps.PADTO, idx, tc.dims[i]), append_opt=False) # PADTO might fail
-                axes[i] = self.rngs[idx]
+                raise KernelOptError(f"tc axis {i} dim {a.vmax+1} not divisible by {tc.dims[i]}")
           except KernelOptError: continue
 
           # we create the warp as a whole thing, in case some of these ranges are moved/removed later
