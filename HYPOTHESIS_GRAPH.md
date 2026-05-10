@@ -433,23 +433,43 @@ See section IV for the full chain table and reopened hypotheses. Key finding: "c
 
 Ranked by impact per line of code. Tiebreaker: fewer lines wins.
 
-| # | Edge | LOC | Expected impact | Impact/line |
+| # | Edge | LOC | Expected impact | Status |
 |---|---|---|---|---|
-| 1 | chunk_size sensitivity (32 vs 128 vs 256) | 1 | unknown (needs measurement) | high if positive |
-| 2 | Contiguous+prune merge (branch exists) | 0 (merge) | 14x Metal GGUF | ∞ |
-| 3 | Joint GROUP+LOCAL+UPCAST for matvec | ~20 | closes 1.10x abduction gap | medium |
-| 4 | Cythonize `rewrite` (307ms hotspot) | ~60 | -10 to -15% schedule | medium |
-| 5 | Huffman if-elif in Cython rewrite | ~30 | branch-predicted dispatch | medium (needs #4) |
-| 6 | Bitmask in Cython (eliminate descriptor overhead) | ~10 | -1% (29ms descriptor) | medium |
-| 7 | Theory transfer to non-matmul | ~50 | unknown | unknown |
-| 8 | Algebraic fusion (online softmax) | ~200 | fuse 3 kernels → 1 | low |
-| 9 | Native Q6K matmul kernels | ~300 | close 2.6x gap | low |
-| 10 | Fused dequant UOp rewrite | ~200 | depends on #9 | low |
-| ~~11~~ | ~~CPL scheduling~~ | ~~10~~ | ~~killed on Metal~~ | — |
+| 1 | chunk_size sensitivity (32 vs 128 vs 256) | 1 | unknown | needs LLM model |
+| 2 | Theory transfer to non-matmul | ~50 | unknown | open |
+| 3 | Algebraic fusion (online softmax) | ~200 | fuse 3 kernels → 1 | open |
+| 4 | Native Q6K matmul kernels | ~300 | close 2.6x gap | open |
+| 5 | Fused dequant UOp rewrite | ~200 | depends on #4 | open |
+
+### Matvec mini-beam — SCOPED, DEFERRED
+
+The abduction loop is 1.10x slower than the heuristic on matvec because GROUP+LOCAL+UPCAST interact non-additively — greedy search can't find the joint optimum.
+
+Three implementation options:
+
+| Option | LOC | Needs | Risk |
+|---|---|---|---|
+| A: Shape-adaptive config table | ~10 | prior measurement data | ordering might be wrong on this hardware |
+| B: Static bandwidth cost model | ~20 | validated model | Metal scheduling is complex |
+| C: Deferred mini-beam (5 configs, cached) | ~40 | plumbing (buffers → heuristic) | first-run latency |
+
+The real unlock is running the abduction loop on the current machine to get measurement data, then encoding the winner as Option A (0 new heuristic lines — just change defaults if suboptimal). The gap is 10% on one workload class. Deferred until the abduction engine exists in speedygrad.
+
+### Completed (this session)
+- ~~Contiguous+prune~~ — already on master
+- ~~Cythonize `rewrite`~~ — shipped, pattern matching in C
+- ~~Huffman if-elif~~ — killed, bitmask subsumes (4.5ms max savings)
+- ~~Bitmask early-reject~~ — shipped, -2.9% e2e (also visible in pure CPython)
+- ~~List-indexed dispatch~~ — shipped, replaces dict.get
+- ~~Skip mega guard~~ — shipped
+- ~~Cythonize toposort + dfs_match~~ — shipped, graph traversal in C
+- ~~Inline cached_bpm_rewrite~~ — shipped
+- ~~Sou-ly #15491 dfs_match~~ — ported with attribution
 
 ### Killed
 - CPL + LUC + APRP — Metal shader compiler absorbs instruction order
-- Warp-reduce for sum — exp2 computation dominates; needs algorithmic fusion (#8) to unlock
+- Huffman branch prediction — bitmask subsumes; 93% skip rate means ordering is irrelevant (4.5ms max)
+- Warp-reduce for sum — exp2 computation dominates; needs algorithmic fusion (#3) to unlock
 
 ---
 
