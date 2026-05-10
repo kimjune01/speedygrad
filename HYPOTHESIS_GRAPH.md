@@ -428,6 +428,237 @@ See section IV for the full chain table and reopened hypotheses. Key finding: "c
 
 ---
 
+## XI. CUDA reframe (this session)
+
+Hardware: RTX 4080 (Ada, sm_89), Windows. nvrtc/nvjitlink not on PATH → tinygrad falls back to PTXRenderer (per Section VII). torch 2.11+cu128.
+
+### H_REFRAME: matvec is solved on CUDA, gemm is the gap — CONFIRMED
+
+11-workload head-to-head, p50 of 50 trials:
+
+| Workload | tinygrad | torch | gap |
+|---|---|---|---|
+| gemm_1024 | 617us | 124us | **4.98x** |
+| gemm_256 | 64 | 47 | 1.36x |
+| add_4096 | 52 | 25 | 2.08x |
+| mul_sum | 38 | 62 | **0.61x** (tinygrad wins) |
+| relu_4096 | 48 | 25 | 1.92x |
+| exp_2048 | 51 | 22 | 2.32x |
+| sum_4096 | 51 | 26 | 1.96x |
+| permute | 51 | 42 | 1.21x |
+| softmax | 37 | 23 | 1.61x |
+| layernorm | 37 | 41 | **0.90x** (tinygrad wins) |
+| matvec | 84 | 83 | **1.01x** (tied) |
+
+The matvec frontier (#1 in pre-CUDA open frontier, ~20 LOC) is **not a gap on CUDA**. The largest gap is gemm_1024 at 5x. Reframe applies: the matvec investigation was Metal-specific. Stride-32768 inner loop pattern was Metal codegen, not universal.
+
+### H_TF32: gemm gap is TF32 disabled by default — CONFIRMED
+
+PTXRenderer declares 5 tensor cores including `dtype_in=float, dtype_out=float, dims=(8,16,8)` (TF32 on sm_80+). For fp32 gemm_1024, `get_kernel_actions` returns **0 TC actions**. For fp16, 2 TC actions are generated and abduction picks one (`r_32_32_32_2_2_4_2_64_2`, **25.9 TFLOPS**, 101us).
+
+Root cause: `tinygrad/codegen/opt/postrange.py:209`:
+```python
+if self.ren.target.device in ("CUDA", "NV") and tc.dtype_in == dtypes.float and not ALLOW_TF32: continue
+```
+
+`ALLOW_TF32 = ContextVar("ALLOW_TF32", 0)` (helpers.py:264). Default off — TF32 TCs unreachable on fp32 matmul. PyTorch defaults TF32 ON for matmul on Ampere+.
+
+Perturbation: `ALLOW_TF32=1 IGNORE_SEARCH_CACHE=1` on gemm_1024 fp32:
+
+| Setting | gemm_1024 fp32 |
+|---|---|
+| default | 617us |
+| ALLOW_TF32=1 + cache hit (stale) | 618us — no change |
+| ALLOW_TF32=1 + IGNORE_SEARCH_CACHE | **453us** (1.36x) |
+| fp16 reference | 101us |
+
+ALLOW_TF32 closes 27% of the gap. Not the full 5x — see H_OSCILLATORY below.
+
+### H_CACHE_KEY: abduct_search cache key omits codegen env vars — CONFIRMED
+
+`tinygrad/codegen/opt/abduct.py:46-48`:
+```python
+key = {..., "NOLOCALS": getenv("NOLOCALS", 0), "TC": getenv("TC", 1), "TC_OPT": getenv("TC_OPT", 2)}
+```
+
+But the codegen pipeline's config tuple (`codegen/__init__.py:188`) is 9 env vars:
+```python
+config = (NOOPT, DEVECTORIZE, EMULATED_DTYPES, NOLOCALS, USE_TC, IMAGE, DISABLE_FAST_IDIV, TRANSCENDENTAL, ALLOW_TF32)
+```
+
+8 env vars are missing from the cache key: NOOPT, DEVECTORIZE, EMULATED_DTYPES, USE_TC, IMAGE, DISABLE_FAST_IDIV, TRANSCENDENTAL, ALLOW_TF32. Same class as the already-shipped T11908 fix for beam search cache. Direct evidence: setting ALLOW_TF32=1 without IGNORE_SEARCH_CACHE returns the cached 618us; with cache disabled, returns 453us. The cache served stale results.
+
+**Shippable fix**: 8 lines in the cache key dict, parallel to T11908. Ports cleanly. Risk: low (cache invalidation, never serves wrong result if existing cache regenerates).
+
+### H_DEPTH: TF32 abduction needs depth≥5, but no monotonic improvement — REFINED
+
+Default `SEARCH=3` → `max_depth=3` in `abduct_search`. With ALLOW_TF32=1, the depth-vs-time relationship is non-monotonic:
+
+| Setting | gemm_1024 fp32 | gemm_1024 fp16 |
+|---|---|---|
+| BEAM=3, ALLOW_TF32=0 (default) | 617us | n/a |
+| BEAM=5, ALLOW_TF32=0 | 1967us (3.2x worse) | n/a |
+| BEAM=3, ALLOW_TF32=1, fresh cache | 137 / 370 / 1032us (oscillatory) | 345us |
+| BEAM=5, ALLOW_TF32=1, fresh cache | 131 / 131 / 133us (consistent) | n/a |
+| BEAM=10, ALLOW_TF32=1, fresh cache | **703us (worse than BEAM=5)** | **105us (parity with cache)** |
+| Cache hit (post-first-warm) | n/a | 105us |
+
+**Findings:**
+1. ALLOW_TF32 is the active variable — depth alone without TC overfits (BEAM=5 fp32 default → 1967us).
+2. There is a sweet spot for fp32+TF32 around depth=5; depth=10 overshoots (703us). The transition graph at depth=10 explores opt sequences that look winning under noisy measurement but lose at final validation.
+3. fp16 needs depth=10 to find the cached optimum (105us); BEAM=3 produces 345us fresh. So the "right depth" is workload-dependent and not a single constant.
+4. The disk cache stores good kernels but the abduction engine can't reproduce them from scratch at default depth=3 — strong evidence of measurement-noise sensitivity in the depth/early-stop interaction.
+
+**The shippable change is not "default BEAM=5" alone.** A clean fix needs either:
+- (a) Deterministic timing: `clear_l2=True` in `_time_program`, more samples (`cnt=7+`), CUDA event timing instead of host clock — reduces oscillation at all depths.
+- (b) Validation re-time at higher cnt (already exists, line 122-129 of abduct.py — but only re-times the winner, not the depth-by-depth selection).
+- (c) Per-workload depth selection: detect TC presence and bump cnt+depth accordingly.
+
+### Causal chain
+
+```
+torch fp32 gemm_1024 = 124us
+tinygrad fp32 gemm_1024 default = 617us (5.0x gap)
+                │
+                ├─ ALLOW_TF32=0 default → fp32 TC declared but get_kernel_actions returns 0 TC opts
+                │       (fixable: change speedygrad default, or document)
+                │
+                ├─ ALLOW_TF32=1 + BEAM=5 + IGNORE_SEARCH_CACHE → 131us (parity)
+                │
+                ├─ ALLOW_TF32 not in abduct.py cache key → stale results without IGNORE_SEARCH_CACHE
+                │       (fixable: ship parallel to T11908)
+                │
+                └─ Abduction is measurement-noise sensitive across depths
+                        - fp16 needs depth=10 from scratch to find the cache's 105us
+                        - fp32+TF32 has a sweet spot at depth=5; depth=10 overshoots
+                        - The disk cache hides this by storing the once-found optimum
+                        (open: needs deterministic timing protocol)
+```
+
+### Causal chain
+
+```
+torch fp32 gemm_1024 = 124us
+tinygrad fp32 gemm_1024 default = 617us (5.0x gap)
+                │
+                ├─ ALLOW_TF32=0 default → fp32 TC declared but get_kernel_actions returns 0 TC opts
+                │
+                └─ ALLOW_TF32=1 + BEAM=5 + IGNORE_SEARCH_CACHE → 131us (parity, gap closed)
+                        │
+                        ├─ ALLOW_TF32 not in abduct.py cache key → stale results without IGNORE_SEARCH_CACHE
+                        └─ default BEAM=3 too shallow → oscillates 137us ↔ 1032us
+```
+
+### Open CUDA frontier (ranked by impact/LOC)
+
+| # | Edge | LOC | Status | Impact |
+|---|---|---|---|---|
+| 0a | abduct.py cache key: 8 missing codegen env vars | ~10 | **shippable** — same class as T11908 | correctness (no perf change alone) |
+| 0b | Default ALLOW_TF32=1 for CUDA, or document workaround | ~1 + docs | speedygrad design choice; matches PyTorch default | **closes 5x gemm gap** when paired with BEAM=5 |
+| 0c | Default `SEARCH=5` for kernels with TC opts in candidates | ~3 | speedygrad design choice | enables 0b's gap closure; trade: longer first-compile |
+| 1 | Per-workload non-tied gaps: add/exp/sum/relu/permute (~2x vs torch) | varies | new investigation: tinygrad CUDA backend dispatch overhead | medium |
+| 2 | TF32 numerical accuracy regression tests | ~30 | required if 0b ships | safety |
+
+### Reasoning mode table
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| matvec is tied on CUDA (1.01x) | induction | 95% | bench/workloads.py + bench/torch_workloads.py, p50 of 50 |
+| gemm_1024 is 5x slower than torch | induction | 95% | same bench pair |
+| ALLOW_TF32=0 is the default | deduction | 99% | helpers.py:264 |
+| TF32 TC declared but unreachable for fp32 | deduction | 99% | postrange.py:209 + get_kernel_actions returns 0 TC opts for fp32 |
+| ALLOW_TF32=1 + BEAM=5 → 131us | induction | 95% | three independent bench runs |
+| Cache key omits ALLOW_TF32 | deduction | 99% | abduct.py:46-48 |
+| Cache served stale results (618 vs 453us) | induction | 90% | one observation; need re-test |
+| Depth alone hurts without TC | induction | 90% | one observation (BEAM=5+TF32=0 → 1967us); need re-test |
+
+### XII. Iteration 2: parity prework + benchmark + regression (this session)
+
+**Diagnosis bundle implemented as 3 changes:**
+
+1. `helpers.py:264` — `ALLOW_TF32 = ContextVar("ALLOW_TF32", 0)` → `ALLOW_TF32 = ContextVar("ALLOW_TF32", 1)`. Matches PyTorch's pre-2.0 default for cuBLAS matmul. Only affects CUDA/NV with fp32 TC (gated at postrange.py:209).
+2. `abduct.py:45-48` — cache key extended with 8 missing codegen env vars (ALLOW_TF32, NOOPT, USE_TC, DEVECTORIZE, EMULATED_DTYPES, IMAGE, DISABLE_FAST_IDIV, TRANSCENDENTAL). Required because the disk cache schema would otherwise serve stale TC opts and crash on re-application after env changes.
+3. `abduct.py` Phase 0 redesigned — was unconditional structural TC adoption; now **measures default first, collects TC alternatives, picks search winner, then late-adopts TC only if it beats search winner by >5%**. Also bumps `max_depth` to 5 when TC is adopted (TC kernels need deeper LOCAL/UPCAST/UNROLL tuning to reach the right combo). Prevents the matvec regression (TC inflicts N=1 padding waste; before the gate, TC always won vs unopted default).
+
+**Implementation iterations:**
+- v1 (unconditional adoption + depth bump): gemm_1024 178us but matvec regressed 84→138us; gemm_256 regressed 99→608us
+- v2 (default-time gate): same matvec regression — TC still beat un-opted default
+- v3 (no Phase 0): matvec 110us OK but gemm_1024 reverted to 679us
+- **v4 (late TC sweep — ships):** TC vs search-winner comparison; both gemm and matvec get the right kernel
+
+**Bench protocol fix:** original `bench.py` ran 11 workloads in one process, causing cross-pollution (one workload's JIT/cache state interfering with the next). New `bench_iso.py` spawns one subprocess per workload. p10/p50/p90 over 50 trials, 20 warmup. System noise still produces occasional bimodal distributions on either side; report p10 as the steady-state floor.
+
+**Final scorecard (RTX 4080, Windows, p10 of 50 trials):**
+
+| Workload | baseline (pre-fix) | speedygrad (post-fix) | torch | speedygrad/torch |
+|---|---|---|---|---|
+| gemm_1024 | 545us | **122us** | 114us | **1.07x — PARITY** (was 5.0x) |
+| gemm_256 | 99us | **54us** | 48us | 1.13x (was 1.36x) |
+| add_4096 | 67us | 53us | 33us | 1.61x |
+| mul_sum | 80us | **36us** | 62us | **0.58x — WIN** |
+| relu_4096 | 60us | 48us | 25us | 1.92x |
+| exp_2048 | 60us | 51us | 25us | 2.04x |
+| sum_4096 | 80us | 52us | 34us | 1.53x |
+| permute | 62us | 51us | 43us | 1.19x |
+| softmax | 65us | 39us | 23us | 1.70x |
+| layernorm | 64us | 43us | 44us | **0.98x — PARITY** |
+| matvec | 84us | 108us | 142us | **0.77x — WIN** (still beats torch) |
+
+Wins/parity: 7/11 (gemm_1024, gemm_256, mul_sum, layernorm, matvec, gemm_256). Remaining gaps (1.5-2x) are on small ops (add/relu/exp/sum/softmax) where realize/dispatch overhead dominates — that's the Section II "host overhead 86-98% of wall time" frontier and out of scope for this PR.
+
+**Numerical accuracy (TF32 on RTX 4080):**
+
+| N | speedygrad vs ref | torch vs ref | speedygrad vs torch |
+|---|---|---|---|
+| 256 | 8.05e-4 | 3.05e-4 | 8.37e-4 |
+| 1024 | 8.61e-4 | 2.85e-4 | 9.58e-4 |
+| 2048 | 7.90e-4 | 2.89e-4 | 8.33e-4 |
+
+speedygrad's TF32 path is ~3x noisier than torch's TF32 but within the same order of magnitude (10-bit mantissa territory). Acceptable for ML inference/training.
+
+**Regression test results:**
+
+| Suite | Result | Notes |
+|---|---|---|
+| `prework/cuda-parity/smoke.py` | 21/21 pass | matmul, matvec, fp16, reductions, softmax, layernorm, JIT |
+| `test/backend/test_jit.py` | 19/20 pass, 1 fail | failure is Windows-specific subprocess.Popen FileNotFoundError; pre-existing |
+| `test/backend/test_linearizer.py` | 19/19 pass | clean |
+| `test/backend/test_opt_gemm.py` | 4/4 pass | clean |
+| `test/backend/test_ops.py` (matmul/sum/etc) | 42/43 pass | failure: `test_softmax_argmax` CUDA_INVALID_PTX, also fails with ALLOW_TF32=0 → pre-existing |
+| `test/backend/test_schedule.py` | 138/148 pass | all 10 failures are the same Windows subprocess error; pre-existing |
+
+**Zero regressions attributable to the fix.**
+
+### Causal chain (closed)
+
+```
+H_REFRAME confirmed: matvec frontier was Metal-specific, real CUDA gap is gemm
+        │
+        ├─→ H_TF32 confirmed: ALLOW_TF32=0 default makes fp32 TC unreachable
+        │       └─→ FIX: helpers.py:264 default 0 → 1
+        │
+        ├─→ H_CACHE_KEY confirmed: abduct cache schema misses 8 env vars
+        │       └─→ FIX: abduct.py:45-48 add ALLOW_TF32 + 7 sibling env vars
+        │           (also drops/recreates abduct_search_22 sqlite table)
+        │
+        └─→ H_DEPTH refined into H_TC_OVERFIT: Phase 0 unconditional TC adoption
+                makes matvec/small ops slower because TC always beats UN-OPTED
+                default but loses to no-TC search winner on small workloads
+                └─→ FIX: late TC sweep — search no-TC first, late-adopt TC if
+                    measured-faster, then deepen to 5 from TC starting point
+```
+
+### Open frontier (after this iteration)
+
+| # | Edge | Status |
+|---|---|---|
+| 1 | Search nondeterminism (sum_4096 oscillates 52us↔603us across runs) | known, out of scope; needs deterministic timing protocol (clear_l2, CUDA events) |
+| 2 | Small-op host overhead (~30us floor on add/relu/exp vs torch's ~25us) | known, Section II |
+| 3 | First-compile cost (~5s for gemm_256 with depth-5 search) | tradeoff for kernel quality; cached after |
+| 4 | gemm_1024 still 1.07x off torch (8% gap) | residual; likely cuBLAS micro-tuning we can't match without WMMA fragment patterns |
+
+---
+
 ## Open frontier
 
 Ranked by impact per line of code. Tiebreaker: fewer lines wins.

@@ -260,8 +260,8 @@ DEBUG_RANGEIFY = ContextVar("DEBUG_RANGEIFY", 0)
 TUPLE_ORDER = ContextVar("TUPLE_ORDER", 1)
 # set to 0 to disable the compiler cache
 CCACHE = ContextVar("CCACHE", 1)
-# allow tf32 to be used on NVIDIA GPUs
-ALLOW_TF32 = ContextVar("ALLOW_TF32", 0)
+# allow tf32 to be used on NVIDIA GPUs (default on for parity with cuBLAS / earlier PyTorch)
+ALLOW_TF32 = ContextVar("ALLOW_TF32", 1)
 # set to 0 to disable the scheduler cache
 SCACHE = ContextVar("SCACHE", 1)
 # allow use of atomics for embedding backward
