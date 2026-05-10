@@ -42,18 +42,33 @@ Shapes: N=1024 for gemm/mul\_sum, 256 for gemm\_256/softmax/layernorm/permute, 4
 
 Net: **-148 lines** across `tinygrad/` and `test/` (+300, -448) vs upstream at fork point. Measured by `git diff 72a504471..HEAD --stat -- tinygrad/ test/`.
 
-## How to use
+## Setup
 
 ```bash
-# default: abduction search (SEARCH=3)
-python3 my_model.py
+git clone https://github.com/kimjune01/speedygrad.git
+cd speedygrad
 
-# fast mode: GROUPTOP=32 stub only, no search
-SEARCH=0 python3 my_model.py
-
-# with Cython schedule speedup
+# optional: Cython schedule speedup (~50% faster compile)
 python3 setup_cy.py build_ext --inplace
-import monkeypatch  # add to your script
+```
+
+## Usage
+
+```python
+from tinygrad import Tensor
+
+# works out of the box — SEARCH=3 finds fast kernels automatically
+out = Tensor.randn(256, 256).softmax()
+
+# optional: activate Cython schedule path
+import monkeypatch
+```
+
+```bash
+# override search depth
+SEARCH=0 python3 my_model.py   # GROUPTOP=32 stub only, no search (fastest compile)
+SEARCH=1 python3 my_model.py   # shallow search (good tradeoff)
+SEARCH=3 python3 my_model.py   # default (best kernels, ~2s first-run cost)
 ```
 
 ## Investigation
