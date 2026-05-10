@@ -231,7 +231,7 @@ class _DEV(ContextVar):
       f"{k}={v} is deprecated, use DEV='{';'.join([repr(t) for t in self._value if t.device != dev] + [f'{dev}:{v}'])}' instead"
     return replace(next((t for t in self._value if not t.device or t.device == dev), Target(device=dev)).replacedefault(**kwargs), device=dev)
 
-DEV, DEBUG, SEARCH, NOOPT = _DEV("DEV", ""), ContextVar("DEBUG", 0), ContextVar("SEARCH", 0), ContextVar("NOOPT", 0)
+DEV, DEBUG, SEARCH, NOOPT = _DEV("DEV", ""), ContextVar("DEBUG", 0), ContextVar("SEARCH", 3), ContextVar("NOOPT", 0)
 IMAGE, FLOAT16, OPENPILOT_HACKS = ContextVar("IMAGE", 0), ContextVar("FLOAT16", 0), ContextVar("OPENPILOT_HACKS", 0)
 JIT, JIT_BATCH_SIZE = ContextVar("JIT", 2 if OSX and ARCH_X86 else 1), ContextVar("JIT_BATCH_SIZE", 32)
 WINO, CAPTURING, TRACEMETA, NO_COLOR = ContextVar("WINO", 0), ContextVar("CAPTURING", 1), ContextVar("TRACEMETA", 1), ContextVar("NO_COLOR", 0)
