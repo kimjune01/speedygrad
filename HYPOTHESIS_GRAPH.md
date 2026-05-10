@@ -476,7 +476,13 @@ Perturbation: online softmax on 1023 vs 1024 columns (same kernel template, diff
 
 **Survives at the heuristic level.** tinygrad's `.divides()` checks may choose different (worse) OPT sequences for non-aligned dimensions — not because the GPU is slower, but because the heuristic has fewer valid opt choices. This is the real cost of irregular shapes: not hardware penalty, but heuristic option reduction. The 165 lines of alignment/validity infrastructure exist to work around the heuristic's constraints, not the GPU's.
 
-Implication: padding helps indirectly by giving the heuristic more valid opt choices (e.g., UPCAST by 4 requires dim % 4 == 0). The benefit is heuristic quality, not kernel speed. ~50 lines of `.divides()` guards and PADTO infrastructure could be simplified if dimensions are pre-aligned.
+**CONFIRMED at Tensor level: 9.2x on softmax dim=4093 vs 4096.** The heuristic produces fundamentally different kernels:
+- dim=4093: `r_16_4_4093` (UPCAST+LOCAL, no GROUPTOP, no warp-reduce) → 1813us
+- dim=4096: `r_64_32_128` (GROUPTOP=32, warp-reduce via simd_sum/simd_max) → 197us
+
+Pad-compute-truncate (4093→4096, pad with -inf, shrink output) recovers 92% of aligned performance (212us) with exact correctness (diff=1.86e-09). The 9.2x speedup comes entirely from the heuristic's `.divides()` guard unlocking GROUPTOP=32.
+
+This is the largest single finding of the session. The GPU hardware is neutral (p10 identical for 4093 vs 4096 in raw kernel benchmarks). The ENTIRE 9.2x comes from the heuristic choosing a different kernel structure. ~50 lines of `.divides()` guards and PADTO infrastructure could be replaced by a 1-line auto-padder at the Tensor API level.
 
 **H: Morton-ordered tile loading for fused dequant.** Interleave quantized weight bytes and scale factors so they share cache lines, rather than loading from separate memory regions. Same principle as GPU texture swizzling — bit-interleaving preserves 2D locality in 1D memory. Perturbation: compare sequential vs Morton-ordered Q6K block loading in the dequant kernel.
 
