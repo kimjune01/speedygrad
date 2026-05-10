@@ -55,6 +55,19 @@ def abduct_search(s:Scheduler, rawbufs:list[Buffer], max_depth:int=3, disable_ca
   rawbufs = _ensure_buffer_alloc(rawbufs)
   var_vals = {k.expr:int(k.vmax+k.vmin)//2 for k in s.ast.variables()}
 
+  # phase 0: try TC first — structural transform, not search
+  # TC is provable from the AST (matmul pattern + compatible dtypes)
+  # the proxy measurement makes TC appear slower at test scale, so we skip the search for it
+  candidates = get_kernel_actions(s, include_0=False)
+  tc_candidates = {i: c for i, c in candidates.items() if c.applied_opts and c.applied_opts[-1].op == OptOps.TC}
+  if tc_candidates:
+    for idx, tc_sched in tc_candidates.items():
+      _, compiled = _try_compile((idx, tc_sched))
+      if compiled is not None:
+        s = tc_sched
+        if DEBUG >= 2: print(f"ABDUCT: TC applied {tc_sched.applied_opts[-1]}")
+        break
+
   _, compiled_default = _try_compile((0, s))
   if compiled_default is None:
     if DEBUG >= 1: print("ABDUCT: failed to compile default kernel")
