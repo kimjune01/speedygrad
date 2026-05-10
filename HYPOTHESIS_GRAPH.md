@@ -76,12 +76,11 @@ BEAM is grid search over a hyperparameter space with beam pruning. 193 actions, 
 5. **No kernel triage** — same search budget on 7us copy kernels as on 1ms compute kernels.
 6. **Early stop discards diagnostics** — bad candidates' failure modes are evidence, but timing stops after one sample.
 
-### H5: Hybrid architecture — PROPOSED
+### H5: Hybrid architecture — SUPERSEDED by abduction engine
 
-The heuristic is a two-layer system: structural priors (pattern matching on the AST) and parameterized transformations (upcast amounts, local sizes, thresholds). The abduction engine should:
+Originally proposed: keep structural priors, replace parameters with measurement. The actual outcome went further: the entire heuristic was deleted (190 lines). The abduction engine (90 lines) replaces both structural priors and parameters with measurement-driven search. The GROUPTOP=32 stub (4 lines) is the only surviving structural prior.
 
-1. Keep the structural priors (TC eligibility, kernel class detection, stride analysis)
-2. Replace the parameters with measurement
+The abduction engine should:
 3. Fix the structural priors when measurement proves them wrong
 4. Cache the theory for amortization
 
@@ -433,17 +432,31 @@ See section IV for the full chain table and reopened hypotheses. Key finding: "c
 
 Ranked by impact per line of code. Tiebreaker: fewer lines wins.
 
-| # | Edge | LOC | Expected impact | Status |
-|---|---|---|---|---|
-| 1 | chunk_size sensitivity (32 vs 128 vs 256) | 1 | unknown | needs LLM model |
-| 2 | Theory transfer to non-matmul | ~50 | unknown | open |
-| 3 | Algebraic fusion (online softmax) | ~200 | fuse 3 kernels → 1 | open |
-| 4 | Native Q6K matmul kernels | ~300 | close 2.6x gap | open |
-| 5 | Fused dequant UOp rewrite | ~200 | depends on #4 | open |
+| # | Edge | LOC | Status |
+|---|---|---|---|
+| 1 | Algebraic fusion (online softmax framework integration) | ~100 | prototype validated (2.5-6.6x), needs UOp wiring |
+| 2 | PADTO removal (extend universal padder to TC dimensions) | -16 | blocks on TC axis padding |
+| 3 | Native Q6K matmul kernels | ~300 | open |
+| 4 | Fused dequant UOp rewrite | ~200 | depends on #3 |
+| 5 | BEAM_* env var rename to SEARCH_* | ~0 | tedious, low priority |
 
-### Matvec mini-beam — SCOPED, DEFERRED
+### Closed this session
+- ~~Theory transfer to non-matmul~~ — superseded by abduction engine (measures per-kernel, no transfer needed)
+- ~~Matvec mini-beam~~ — superseded by abduction engine (finds joint opts automatically via transition graph)
+- ~~chunk_size sensitivity~~ — needs LLM model, deferred indefinitely
+- ~~Cython floor-lowering chain~~ — shipped, 55% schedule speedup
+- ~~Dimension standardization~~ — shipped as universal padder in `_reduce`
+- ~~CPython JIT improvement~~ — out of scope
 
-The abduction loop is 1.10x slower than the heuristic on matvec because GROUP+LOCAL+UPCAST interact non-additively — greedy search can't find the joint optimum.
+### PADTO removal — BLOCKED on TC padding
+
+PADTO infrastructure (16 lines in postrange + OptOps definition) is still used by tensor core padding (`postrange.py:258`): `apply_opt(Opt(OptOps.PADTO, idx, tc.dims[i]))`. TC pads M/N/K axes to multiples of TC tile dimensions (8, 16).
+
+The universal padder in `_reduce` only covers REDUCTION dimensions (axis being reduced). TC padding covers GLOBAL/LOCAL dimensions (M, N axes of matmul). Extending `_reduce`'s padder to cover TC dimensions would require padding at the matmul level, not the reduction level.
+
+If TC padding moves to `Tensor.matmul` (pad M/N to multiples of TC dims, shrink output after), PADTO becomes fully dead: -16 lines postrange, -1 line OptOps definition, -1 BEAM_PADTO action. Total: -18 lines.
+
+### Matvec mini-beam — SUPERSEDED
 
 Three implementation options:
 
@@ -553,11 +566,11 @@ Performance gap (1.2-5.9x vs torch) — CONFIRMED
 │   ├─ post-TC axis selection — CONFIRMED (Metal + CUDA)
 │   │   └─ gfx12 WMMA constraint — CONFIRMED
 │   ├─ MATVEC misclassification — CONFIRMED
-│   ├─ theory transfer — CONFIRMED (matmul class)
-│   │   └─ non-matmul transfer — OPEN
-│   ├─ abduction loop (52 trials, 1.85x) — CONFIRMED
-│   │   └─ joint optimization for matvec — OPEN
-│   ├─ CPL scheduling — KILLED on Metal (shader compiler absorbs)
+│   ├─ theory transfer — SUPERSEDED by abduction engine
+│   ├─ abduction engine (+62% vs heuristic, 8-6-4) — SHIPPED
+│   │   └─ heuristic deleted (190 lines), BEAM deleted (99 lines)
+│   ├─ universal reduction padder (9.2x cliff elimination) — SHIPPED
+│   ├─ CPL scheduling — KILLED on Metal
 │   └─ XOR-swizzle — KILLED on Metal
 │
 ├─ LLM inference gap — CONFIRMED (2.8x F16, 32x Q6K)
@@ -573,7 +586,7 @@ Performance gap (1.2-5.9x vs torch) — CONFIRMED
 │   ├─ redundant root op check (-3.2 to -4.0%) — CONFIRMED
 │   ├─ mega-matcher (-18% micro, 0% e2e) — CONFIRMED
 │   ├─ Cython transpile (-7.3% e2e) — CONFIRMED, SHIPPED
-│   └─ CPython JIT improvement — OPEN
+│   └─ CPython JIT improvement — OUT OF SCOPE
 │
 ├─ Warp-reduce for GROUPTOP — CONFIRMED, ACTIVATED (max 3.50x, sum ~neutral)
 ├─ Renderer fallback detection — CONFIRMED
@@ -584,14 +597,14 @@ Performance gap (1.2-5.9x vs torch) — CONFIRMED
 │   ├─ T12296: max backward underflow (float16) — CONFIRMED, SHIPPED
 │   └─ Sou-ly #15491: toposort → dfs_match — PORTED (29K fewer toposort calls)
 │
-└─ Cython floor-lowering chain
-    ├─ unified_rewrite transpile (-34%) — SHIPPED
-    ├─ bitmask early-reject (-2.9%) — SHIPPED
-    ├─ int(op) descriptor fix — SHIPPED
-    ├─ list-indexed dispatch (-4.8%) — SHIPPED
-    ├─ skip mega guard (-3%) — SHIPPED
-    ├─ Cython rewrite + inline pm (-4.9%) — SHIPPED
-    └─ total: 3.457s → 1.752s (-49%)
+├─ Cython floor-lowering chain
+│   ├─ unified_rewrite transpile (-34%) — SHIPPED
+│   ├─ bitmask early-reject (-2.9%) — SHIPPED
+│   ├─ list-indexed dispatch (-4.8%) — SHIPPED
+│   ├─ Cython rewrite + toposort + dfs_match — SHIPPED
+│   └─ total: 3.457s → 1.57s (-55%)
+│
+└─ Online softmax prototype (2.5-6.6x) — VALIDATED, needs framework integration
 ```
 
 ## PRs
