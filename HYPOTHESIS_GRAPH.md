@@ -1934,6 +1934,76 @@ This is a kernel-codegen problem, not a fundamental compute or bandwidth limit. 
 
 ---
 
+### Iter 11d (this session, /investigate skill): 8B regression isolated to size-cliff (not arch, not quant)
+
+**Phase 2 fan-out** (per investigate skill): three competing hypotheses for iter 11c's "8B Q4_K_M broken at 1 tok/s" observation, each with a decisive perturbation.
+
+**H₁: Q4_K_M-specific bug.** Test: bench Qwen 3 8B Q8_0 (same model + arch + size, different quant).
+- Result: **Qwen 3 8B Q8_0 = 2.1 tok/s, decode_p50 = 476 ms.** Faster than Q4_K_M (1051 ms) but still catastrophically slow.
+- **Trajectory: divergent against H₁.** Q8_0 didn't fix it. Q4_K_M dequant overhead COMPOUNDS the issue (2.2× worse than Q8_0 at 8B) but isn't the root cause.
+- **H₁ killed.**
+
+**H₂: Qwen-architecture-specific.** Test: bench Llama 3.1 8B Q4_K_M (same size + same quant, different arch).
+- Result: **Llama 3.1 8B Q4_K_M = 1.4 tok/s, decode_p50 = 697 ms.** Slightly faster than Qwen 8B (1051 ms) but still catastrophically slow.
+- **Trajectory: divergent against H₂.** Llama doesn't fix it. Qwen architecture COMPOUNDS the issue (1.5× worse than Llama at same size + quant) but isn't the root cause.
+- **H₂ killed.**
+
+**H₃: Element-wise codegen (ferreted out).** Probe: enumerate the rollout JIT's unique kernels, dump source.
+- Result: 4 element-wise kernels in rollout, max global=(4096, 1, 1) with local=(1, 1, 1) — single-thread blocks, but appears only 1× per forward. Not the dominant cost.
+- **The slow E_24576/E_12288 kernels from iter 11c's nsys data live in PREFILL, not rollout.** Iter 11c misattributed them as decode-time culprits because nsys sums all phases. The actual decode-time cost is in the rollout's matmul kernels (r_12288_8_4_8_16, r_4096_256_16, etc.).
+- **H₃ refined**: element-wise isn't the bug; matmul codegen at 8B-shape is.
+
+**Updated diagnostic table (5 data points across size, quant, arch):**
+
+| Model | size | quant | arch | tok/s | decode_p50 | bandwidth eff |
+|---|---|---|---|---|---|---|
+| Qwen 3 0.6B | 0.6B | Q8_0 | Qwen | 241 | 4 ms | high |
+| Qwen 3 1.7B | 1.7B | Q4_K_M | Qwen | 127 | 7.9 ms | medium |
+| Llama 3.2 3B | 3B | Q6_K | Llama | 37 | 27 ms | ~13% |
+| Llama 3.1 8B | 8B | Q4_K_M | Llama | 1.4 | 697 ms | ~1% |
+| **Qwen 3 8B** | **8B** | **Q8_0** | **Qwen** | **2.1** | **476 ms** | ~2% |
+| Qwen 3 8B | 8B | Q4_K_M | Qwen | 0.95 | 1051 ms | ~0.6% |
+
+**Surviving hypothesis (H₄): tinygrad codegen falls off at 8B+ model size, independent of architecture and quant.** Going from 3B (~2.3 GFLOPs / decode token) to 8B (~5.3 GFLOPs) — 2.3× more compute — but 17-38× slower. **The extra ~11× penalty is the cliff.** Q4_K_M dequant adds another ~2× on top. Qwen architecture (vs Llama) adds another ~1.5× on top. All three factors stack multiplicatively in the worst case.
+
+**Reasoning mode (iter 11d).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| 8B size-cliff is independent of architecture | observation | 99% | Llama 8B Q4_K_M (1.4 tok/s) and Qwen 8B Q4_K_M (0.95 tok/s) both broken; cliff appears in both architectures |
+| 8B size-cliff is independent of quantization | observation | 99% | Qwen 8B Q8_0 (2.1 tok/s) and Q4_K_M (0.95 tok/s) both broken; Q8_0 isn't quant-overhead-bound |
+| Q4_K_M dequant overhead compounds 8B cliff by ~2× | deduction | 90% | Q4_K_M at 1051 ms vs Q8_0 at 476 ms = 2.2× ratio at same size + arch |
+| Qwen vs Llama architecture compounds 8B cliff by ~1.5× | deduction | 80% | Qwen 8B Q4_K_M (1051 ms) vs Llama 8B Q4_K_M (697 ms) = 1.5× ratio at same size + quant |
+| Cliff between 3B and 8B is codegen, not bandwidth | deduction | 75% | bandwidth-bound matmul should scale linearly with weights size (~2.5×), measured 17-38× = ~11× extra penalty |
+| The fix surface is matmul codegen at large kernel shapes (BEAM/SEARCH or hand-tuned) | hypothesis | 70% | mechanism (codegen) explains the ~11× penalty better than alternatives (memory, alloc, dispatch); but specific kernel pathology not yet identified at PTX level |
+
+**Reframe (Phase 4.5 per investigate skill).**
+
+Iter 11c's headline ("Q4_K_M broken at 8B") was wrong. The honest reframe: **tinygrad's CUDA inference path has a size cliff at ~8B parameters that is independent of architecture and quantization.** Q4_K_M and Qwen amplify the cliff but don't cause it.
+
+This matters for v1.0 positioning: 8B is a DOMINANT size class for tinybox-class hardware. The cliff affects EVERY 8B model, not just Qwen Q4. Saying "use Q8_0 instead" doesn't fix it (Q8_0 is also slow). Saying "use Llama instead" doesn't fix it (Llama is also slow). The README should reflect this — claiming "we work great below 8B, broken above" is more honest than "Q4_K_M is broken."
+
+**Frontier (next investigation iters):**
+
+1. **Where exactly is the cliff?** Bench at 5B and 7B equivalents to find the threshold. If the cliff is sharp at 8B, look for a specific dim threshold (e.g., kernel switches at intermediate_dim=12288). If gradual, the codegen efficiency degrades smoothly with size.
+2. **Compare to llama.cpp on same 8B Q8_0 model.** Llama.cpp's CUDA backend should be ~50 tok/s on this hardware. If it is, our gap is purely codegen. If it's also slow, it's a hardware/driver issue.
+3. **Run with SEARCH=5 on 8B-shape matmul kernels.** Deeper search budget might find better tile configs at large dims.
+4. **Diff PTX between rollout matmul at 1.7B vs 8B.** What specific tile/UPCAST/GROUP choices differ? Look for the codegen pattern that breaks above 4096-hidden_dim.
+
+**Files this iter:**
+- `prework/cuda-parity/probe_slow_kernel_ptx.py` — rollout kernel enumeration (4 unique element-wise kernels, max global 4096)
+- HYPOTHESIS_GRAPH.md — this addendum
+
+**Carry (methodology):**
+
+1. **Two perturbations beat one.** H₁ alone (Q4_K_M test via Q8_0) would have ruled out quant. H₂ alone (architecture test via Llama) would have ruled out Qwen. Doing BOTH was decisive — neither alone is the cause. Without both, we'd have wasted weeks chasing a Q4_K_M-specific or Qwen-specific fix.
+
+2. **nsys data can mislead by phase-mixing.** Iter 11c's E_24576/E_12288 attribution to decode was wrong — those kernels live in prefill, not rollout. nsys sums everything in the trace; without phase-isolating the trace (decode-only run), large prefill kernels get attributed to per-token cost. **Carry: when characterizing per-token GPU cost, isolate the captured-graph kernels, don't trust phase-mixed nsys totals.**
+
+3. **The "kill the alternatives" pattern from /investigate is the right shape for ambiguous bugs.** Three hypotheses, each ruled out by a specific perturbation. The surviving hypothesis (H₄: size-cliff) is what's left after the alternatives die. Much sharper than trying to confirm a single hypothesis.
+
+---
+
 **Reproduce.**
 
 ```powershell

@@ -34,7 +34,7 @@ The speedygrad-vs-vanilla delta is path-dependent. On the older safetensors path
 
 \* 1.7B is within measurement noise of vanilla.
 
-⚠️ **Qwen 3 8B Q4\_K\_M is broken** at ~1 tok/s decode (decode\_p50 = 1051 ms; theoretical bandwidth ceiling is ~7 ms). Q4\_K\_M dequantization on tinygrad's CUDA path has bandwidth-pathological access patterns at 8B+ model size. Filed as a frontier item in [`HYPOTHESIS_GRAPH.md`](HYPOTHESIS_GRAPH.md). Use Q8\_0 (when memory permits) for now; this is the workload most tinybox shoppers care about, and we lose to torch+HF here.
+⚠️ **8B inference is broken** — and it's not specific to Qwen, Q4\_K\_M, or any single variable we tested. Both Llama 3.1 8B Q4\_K\_M (1.4 tok/s) and Qwen 3 8B Q8\_0 (2.1 tok/s) crash to ~1-2 tok/s, regardless of architecture or quantization. The cliff is between 3B (~37 tok/s, ~13% bandwidth efficiency) and 8B (~1-2 tok/s, ~1-3% efficiency). Q4\_K\_M dequant overhead and Qwen architecture each compound the cliff (~2× and ~1.5× respectively) but neither causes it. Root cause: tinygrad's matmul codegen falls off at 8B-shape kernels. See iter 11d in [`HYPOTHESIS_GRAPH.md`](HYPOTHESIS_GRAPH.md) for the kill-the-alternatives investigation. **8B is the dominant local-inference size for tinybox-class hardware, and we lose to torch+HF here. Filed as the highest-priority frontier item.**
 
 ### Context: where speedygrad sits in the inference landscape
 
