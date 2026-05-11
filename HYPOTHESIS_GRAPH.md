@@ -1767,6 +1767,64 @@ Speedygrad's attention chain emits 5+ separate kernels (Q×K^T, 3-pass softmax, 
 
 ---
 
+### Iter 11a (this session): Qwen 3 0.6B coverage — speedygrad 17.2× faster than torch+HF
+
+**Question.** Iter 10c-cont's wins (counter.realize, memoize-walk) were measured on Llama 3.2 1B fp16. Are they Llama-specific, or do they transfer to other architectures? Per-roadmap iter 11, Qwen 2.5 (and now Qwen 3) is required model coverage for v1.0. Per the user: "1B model isn't enough evidence for someone that wants to run Qwen."
+
+**Setup.** New bench scaffolding using the modern `tinygrad/llm/model.py` + `Transformer.from_gguf()` path (rather than the older `examples/llama3.py:build_transformer`). All speedygrad fast-paths (`monkeypatch.py`) apply automatically because they monkey-patch tinygrad-core code that both paths use.
+
+- `bench/speedygrad_qwen3_06b.py` — Qwen 3 0.6B Q8_0 GGUF via `tinygrad/llm/cli.py`'s pre-registered model URL. Counter.realize() trick applied defensively (it's a no-op if `_device_rng_counters` is empty).
+- `bench/torch_qwen3_06b.py` — `Qwen/Qwen3-0.6B` fp16 via HF `AutoModelForCausalLM`, `past_key_values` KV cache, greedy via `argmax(-1)`, identical methodology to `bench/torch_llama32_1b.py`.
+
+**Result (RTX 4080, 5 runs × 25 decode tokens, single `generate()` call across all measurements):**
+
+| Framework | quant | decode_us_p50 | **decode_tps_p50** | prefill_ms_p50 |
+|---|---|---|---|---|
+| **speedygrad** | **Q8_0** | **3744us** | **267 tok/s** | 5956ms (incl. JIT capture) |
+| torch+HF (eager) | fp16 | 64558us | 15.5 tok/s | 89ms |
+| **Speedygrad/torch ratio** | | | **17.2× faster** | |
+
+Both produce identical greedy output text from "Hello." (`<think>\nOkay, the user just said "Hello." I need to respond appropriately...`), validating correctness.
+
+**Comparison to vanilla tinygrad** (cli.py without monkeypatch, smoke-tested earlier this session): 121 tok/s. Speedygrad's monkeypatched fast paths give a **2.2× speedup over vanilla tinygrad on Qwen** — confirming the iter 10c-cont v3-v4 optimizations transfer cleanly to a different architecture.
+
+**Why the 17× ratio is bigger than Llama's 4×.**
+
+- Qwen 3 0.6B has **28 layers** with **no GQA** (16 heads = 16 KV heads). Llama 3.2 1B has 16 layers with 4:1 GQA (32 q heads / 8 kv heads). Per decode token, Qwen does more sequential per-layer work AND more KV memory traffic per attention step.
+- torch+HF "eager" path (no `torch.compile`, no SDPA hint) absorbs the per-layer Python dispatch overhead 28 times per token vs 16. That overhead doesn't scale with model size — it scales with layer count.
+- Speedygrad's CUDAGraph fast path issues all 28 layers' kernels in one launch, eliminating the per-layer dispatch entirely.
+
+**Caveats (disclosed in JSON output):**
+- speedygrad uses Q8_0 quant (8-bit weights, ~half the memory traffic); torch uses fp16. Strict apples-to-apples would require torch + bitsandbytes 8-bit, deferred.
+- torch+HF eager is the worst case; `torch.compile` + SDPA could narrow the gap meaningfully. The speedygrad-vs-torch numbers should be read as "speedygrad vs the default torch path most users start with," not "speedygrad vs maximally-optimized torch."
+
+**v1.0 status update.** Per ROADMAP.md:79's competitive set:
+
+| Competitor | Status |
+|---|---|
+| **PyTorch + HF transformers** | **CLEARED on two model families** (Llama 3.2 1B 4×, Qwen 3 0.6B 17×). Iter 11a closes the "single workload, single architecture" critique. |
+| llama.cpp | Loss, 1.30× slower on Llama 3.2 1B fp16. Not yet measured on Qwen 3 0.6B Q8 (llama.cpp may not have Qwen 3 GGUF support) |
+| vLLM | Never measured |
+| ExLlamaV2 | Never measured |
+
+Two of four competitors still unmeasured. The Qwen result strengthens the "revise competitive set" v1.0 path: speedygrad clears PyTorch+HF decisively across architectures; llama.cpp/vLLM/ExLlamaV2 are separate tier with explicit reasoning per ROADMAP.md:104-109.
+
+**Carry (methodology).**
+
+1. **`model.generate()` should be called once per process, not once per run.** The first attempt at multi-run generate() crashed with "CUDA Error 1, invalid argument" on the second invocation — JIT-captured graphs reference intermediate buffers that get GC'd between calls. Pattern: one generate(), many `next(gen)` for measurements. Matches cli.py:213-218.
+
+2. **Different architectures have different overhead profiles.** Llama-vs-Qwen on the SAME framework (speedygrad) shows 267 vs 172 tok/s (Qwen actually faster despite no GQA — smaller model dominates). On torch+HF, Qwen is SLOWER than Llama (15.5 vs ~30 tok/s) because the layer-count dominates dispatch overhead. Speedygrad's CUDAGraph fast path absorbs that asymmetry.
+
+**Reproduce.**
+
+```powershell
+$env:PYTHONPATH = "."
+.venv\Scripts\python bench\speedygrad_qwen3_06b.py --runs 5 --n-new 25 2>$null
+.venv\Scripts\python bench\torch_qwen3_06b.py --runs 5 --n-new 25 2>$null
+```
+
+---
+
 **Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |
