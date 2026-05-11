@@ -1720,6 +1720,53 @@ The remaining 1300-1500us gap is dominated by GPU kernel quality. Realistic floo
 
 ---
 
+### Iter 10c-cont v4+v5 (this session): leak-free memoize-walk + per-kernel gap attribution
+
+**v4: leak-free memoize-walk.** v3's cache `dict[id(uop) -> frozenset[uop]]` held UOps alive via the frozenset value, leaking ~1 entry per decode token. v4 cache: `dict[id(uop) -> frozenset[id(uop)]]` (just integers, no UOp strong refs) + `weakref.finalize(uop, cache.pop, id(uop), None)` registered on each miss. Verified: cache stays at 166 entries across 200 decode tokens (would be ~366 with v3). Canonical bench: 172.2 tok/s (v3 was 171.6) — perf preserved.
+
+**v5: per-kernel gap attribution** (`prework/cuda-parity/probe_per_kernel_gap.py`). Maps each speedygrad kernel to its semantic role and to llama.cpp equivalents.
+
+Per-category GPU gap per forward:
+
+| Category | speedygrad | llama.cpp | gap |
+|---|---|---|---|
+| matmul (all) | 4359us | 3585us | **+774us** |
+| attention (all) | 494us | 75us | **+420us** |
+| rmsnorm | 67us | 73us | −5us (parity) |
+| Other | 31us | 4us | +28us |
+| **TOTAL GPU** | **4949us** | **3736us** | **+1213us** |
+
+Speedygrad's attention chain emits 5+ separate kernels (Q×K^T, 3-pass softmax, A×V). Llama.cpp has ONE fused softmax + a couple separate matmuls (75us total).
+
+**Refined squeeze map (post v4+v5):**
+
+| Squeeze | LOC | Risk | Wall saving | New tps | New ratio |
+|---|---|---|---|---|---|
+| Today's start | — | — | — | 104.5 | 2.14× |
+| + counter.realize() (v2 ✓) | 1 | none | −29% | 146.7 | 1.53× |
+| + memoize-walk leak-free (v3+v4 ✓) | 60 | low | −14% | **172.2** | **1.30×** |
+| + online-softmax only (#2a) | ~150 | low | ~−1% (67us) | 174 | 1.29× |
+| + FlashAttention fusion (#2b) | ~500 | high | ~−7% (420us) | 188 | 1.20× |
+| + matmul codegen tuning (#3) | unknown | hard | ~−5-13% (200-770us) | 196-220 | 1.02-1.14× |
+| **Theoretical floor** | | | | **~220** | **~1.04×** |
+
+**Critical update:** v3 estimated "online-softmax integration: ~250-700us." v5 measurement shows **online-softmax ALONE is 67us** — much less. v3's 250-700us range was implicitly conflating online-softmax with full attention fusion. Splitting:
+
+- **Frontier #2a (online softmax only):** ~150 LOC, low risk, ~1% wall improvement. Diminishing returns, probably not worth the code surface.
+- **Frontier #2b (FlashAttention fusion):** ~500 LOC, high risk (custom CUDA + UOp custom_kernel + correctness verification), ~7% wall improvement.
+
+**Headline.** Speedygrad fp16 1B at **172 tok/s, 1.30× slower than llama.cpp**. Two complete fixes shipped this session (counter.realize in bench + leak-free memoize-walk in monkeypatch.py). Remaining gap fully decomposed: 64% GPU (matmul 47% + attention 35%), 36% host (residual). Further squeezing requires custom CUDA kernel work.
+
+**Carry (methodology, v4+v5).**
+
+1. **Aggregate gap estimates can hide intra-category variance.** v3 estimated frontier #2 at "250-700us." v5 split it: 67us for online-softmax-only vs 420us for full FlashAttention. Same name, very different work. Carry: when an estimate is a wide range, decompose into named sub-fixes before sizing.
+
+2. **Cache values that hold their keys alive are stealth memory leaks.** v3 cache held UOps via frozenset value → leaked ~1 entry per token. v4 stores integer ids + finalizer → bounded. Carry pattern: for caching hashconsed objects with auto-GC, prefer integer/weak-ref cache contents + a finalizer for invalidation on death.
+
+3. **Beating an optimized C++ implementation requires becoming an optimized C++ implementation.** Of the remaining 1213us GPU gap, 420us is attention (requires writing a FlashAttention-style fused kernel — exactly what llama.cpp did) and 774us is matmul codegen (requires search/codegen tuning of FFN W1/W2 specifically). At 1.30× we're a respectable Python framework loss to hand-tuned C++; getting below 1.10× requires writing the same kind of kernels llama.cpp wrote.
+
+---
+
 **Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |
