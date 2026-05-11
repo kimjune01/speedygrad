@@ -1863,6 +1863,77 @@ Two of four competitors still unmeasured. The Qwen result strengthens the "revis
 
 ---
 
+### Iter 11c (this session): Qwen 3 8B Q4_K_M regression diagnosed (codegen, not host)
+
+**Question.** Iter 11b's scaling table exposed Qwen 3 8B Q4_K_M at 1 tok/s — 7× slower than torch+HF eager, on the workload tinybox shoppers care most about. Per the user: "let's debug the 8B regression."
+
+**Smoke test (`prework/cuda-parity/probe_qwen8b_8s.py`).**
+- All 399 model-parameter buffers on CUDA. No CPU fallback.
+- 8.19B params, ~4.1 GB Q4_K_M weights. Loaded in 7.1 s.
+- Steady-state decode: 900-1700 ms / token (TTFT 40 s).
+- `_apply_map_to_tensors`: 1638 us / call × ~1 call per token = **0.0% of wall**. Host overhead is not the bottleneck.
+
+**nsys trace (`prework/cuda-parity/nsys_qwen8b.nsys-rep`).** 13 forwards, per-forward GPU time (mean × instances/forward):
+
+| Kernel | mean | calls/fwd | per-fwd | role |
+|---|---|---|---|---|
+| r_4096_4_8_384 | 3.22 ms | 36 | **116 ms** | matmul over hidden_dim, 1 per layer |
+| r_12288_8_4_8_16 | 2.73 ms | 36 | **98 ms** | FFN matmul (intermediate=12288), 1 per layer |
+| r_3072_256_4_16 | 2.56 ms | 36 | **92 ms** | matmul, 1 per layer |
+| r_toks_4096_16_8_96 | 32.81 ms | ~3 | **91 ms** | per-token op |
+| r_151936_256_4_4 | 75.37 ms | ~1 | **70 ms** | output projection (vocab=151936) |
+| r_toks_12288_16_256n1 | 26.01 ms | ~3 | **72 ms** | per-token FFN op |
+| r_toks_12288_16_256 | 25.15 ms | ~3 | **70 ms** | per-token FFN op |
+| E_24576_4_2_2_16_8 | 18.30 ms | ~6 | **101 ms** | **element-wise (!), should be sub-ms** |
+| E_12288_2_2_2_2_16_16 | 29.29 ms | ~1.5 | **41 ms** | element-wise |
+| Other | — | — | ~110 ms | tail |
+| **Per-forward GPU** | | | **~860 ms** | matches measured 900-1700 ms |
+
+CUDA API: `cuCtxSynchronize` 4.4 s total / 20 calls / **avg 221 ms** — host genuinely waits on GPU work. GPU is busy, not idle.
+
+**Diagnosis: codegen inefficiency at 8B scale.**
+
+Comparison to Llama 1B's largest kernel (which works at 140 tok/s):
+- Llama 1B: r_512_16_512_512_4_4 at 134us median × 16 layers = **2.1 ms / forward**
+- Qwen 8B: r_4096_4_8_384 at 3.22ms × 36 layers = **116 ms / forward**
+- Ratio: **55× longer per kernel-type, with only ~3× more compute**
+- **Per-flop efficiency is ~18× worse on 8B than 1B for similar matmul work.**
+
+This is a kernel-codegen problem, not a fundamental compute or bandwidth limit. Tinygrad's BEAM/SEARCH finds reasonable configurations for 1B-shape matmuls but fails to scale them to 8B shapes. Q4_K_M dequant adds compute per byte read (good for arithmetic intensity) but the resulting kernels may have bad cache reuse, suboptimal threadblock sizing, or unfused dequant-matmul.
+
+**Reasoning mode (iter 11c).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| 8B regression is GPU-side, not host | observation | 99% | _apply_map_to_tensors=0% of wall, cuCtxSync=221ms avg shows real GPU work |
+| Per-flop efficiency ~18× worse on 8B than 1B for matmul | observation | 90% | direct kernel-time comparison normalized by compute ratio |
+| Element-wise kernels at 18-29 ms each are pathological | observation | 95% | E_24576_4_2_2_16_8 at 18ms mean is an element-wise op that should be ≤1ms |
+| Fix is kernel codegen tuning, not host or memory | deduction | 80% | mechanism (codegen) explains the symptom (per-flop inefficiency) more parsimoniously than alternatives (alloc, bandwidth, host) |
+| Fix requires weeks not days | abduction | 70% | tinygrad SEARCH alone may not find better configs (we'd need to verify with deeper SEARCH budget); hand-tuned Q4_K_M dequant + better element-wise codegen are larger projects |
+
+**Hypotheses for future investigation** (filed as iter 12+ frontier items):
+
+1. **Tile sizes not optimal for 8B shapes.** Re-run SEARCH with deeper budget on 8B-specific kernel shapes; may find faster configs.
+2. **L2 cache thrashing across consecutive layers.** 36 layers × ~5 kernels = 180+ kernels back-to-back, each reading 50-100 MB of Q4 weights. L2 (40 MB on 4080) cycles per kernel. Could be helped by execution reordering.
+3. **Q4_K_M dequant possibly not fused with matmul.** Worth checking if tinygrad's PTX renderer emits fused or split dequant+matmul kernels. Llama.cpp hand-fuses these.
+4. **Element-wise codegen broken at 8B shapes.** E_24576_4_2_2_16_8 at 18ms mean is the most suspicious single finding — investigate the generated PTX for this kernel.
+
+**Carry (methodology).**
+
+1. **"Slow" alone isn't a diagnosis.** "8B Q4_K_M is 1 tok/s" was the symptom. The diagnosis (per-flop efficiency 18× worse on 8B than 1B) tells us where the work is and rules out the cheap fixes (it's not host overhead, not OOM, not CPU fallback). Probing changes the conversation from "make it faster" (vague) to "fix the kernel codegen for 8B-shape matmul + element-wise" (concrete).
+
+2. **Symptoms scale linearly with model size only when codegen is competent at the new size.** 1.7B → 8B model size is 4.7×; theoretical decode latency scaling at the same per-flop efficiency would also be 4.7× (i.e., 1.7B's 7.9 ms → 37 ms / 27 tok/s). Actual 8B is 1051 ms — 28× off the linear expectation. When measured perf is way off the theoretical scaling, the codegen has fallen off a cliff at the new size. The diagnostic value of "what does it look like at 1× and 4×" is exactly to detect cliffs like this.
+
+**Files this iter:**
+- `prework/cuda-parity/probe_qwen8b_8s.py` — smoke test
+- `prework/cuda-parity/nsys_qwen8b.py` — nsys runner
+- `prework/cuda-parity/qwen8b_diagnosis.md` — full write-up
+- HYPOTHESIS_GRAPH.md — this addendum
+
+**Next step (NOT this iter):** dive into the generated PTX for r_4096_4_8_384 and E_24576_4_2_2_16_8. Those are the two most-suspect kernels by efficiency-per-FLOP. If we can identify the specific codegen pattern that's broken, the fix surface narrows. Otherwise we're proposing a kernel-tuning campaign which is real engineering work, not a quick monkeypatch.
+
+---
+
 **Reproduce.**
 
 ```powershell
