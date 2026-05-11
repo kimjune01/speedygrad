@@ -10,6 +10,8 @@ Verifies:
 """
 import os, sys
 os.environ.setdefault("DEV", "CUDA")
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+import monkeypatch  # noqa: F401  — activate Cython runtime fast path if built
 
 import numpy as np
 from tinygrad import Tensor, dtypes, TinyJit, Device

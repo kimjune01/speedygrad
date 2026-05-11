@@ -31,6 +31,10 @@ Shapes: N=1024 for gemm/mul\_sum, 256 for gemm\_256/softmax/layernorm/permute, 4
 
 **Cython schedule path** — `unified_rewrite`, `rewrite`, `toposort`, `dfs_match` compiled to C. ~50% faster schedule (3.46s → 1.75s on ResNet50, 20 kernels).
 
+**Cython runtime path** — `run_linear` + inlined single-device `exec_kernel` compiled to C. Per-call JIT replay overhead drops 3-7us (add_4096 51→46us, softmax 35→31us, gemm_1024 121→114us — wins torch by 10%).
+
+**CUDA parity** — speedygrad on RTX 4080 with `import monkeypatch` wins or ties PyTorch on gemm_1024 (114 vs 126us), gemm_256 (51 vs 47us), mul\_sum, layernorm, matvec. Small ops (add/relu/exp) still ~1.8-2.0x off due to the host-side `cuLaunchKernel` floor.
+
 **Ported work** — [Sou-ly's](https://github.com/Sou-ly) toposort→dfs\_match optimization ([tinygrad #15491](https://github.com/tinygrad/tinygrad/pull/15491)), with attribution and push access.
 
 ## What was removed

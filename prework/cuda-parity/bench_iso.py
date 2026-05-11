@@ -1,6 +1,8 @@
 """Per-workload isolated bench. Spawns a fresh subprocess per workload to avoid
 JIT cache / kernel-cache cross-pollution that biased bench.py's sequential runs.
 
+Activates monkeypatch (Cython runtime fast path if cy_runtime.pyd built).
+
 Usage:
   python bench_iso.py speedygrad   # runs all workloads in subprocesses
   python bench_iso.py torch
@@ -8,6 +10,9 @@ Usage:
   python bench_iso.py worker speedygrad gemm_1024  # internal: single workload
 """
 import os, sys, json, subprocess, time
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
+try: import monkeypatch  # noqa: F401
+except Exception: pass
 
 WORKLOADS = ["gemm_1024", "gemm_256", "add_4096", "mul_sum", "relu_4096", "exp_2048",
              "sum_4096", "permute", "softmax", "layernorm", "matvec"]

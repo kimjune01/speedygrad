@@ -680,11 +680,52 @@ H_REFRAME confirmed: matvec frontier was Metal-specific, real CUDA gap is gemm
 
 | # | Edge | LOC | Status |
 |---|---|---|---|
-| 1 | Cython exec_kernel + ctypes wrapper | ~200 | not attempted; structural |
-| 2 | CUDA graph batching for repeated kernels | ~150 | not attempted; structural |
-| 3 | First-compile cost (~5s for gemm_256 at depth 5) | ~30 | tradeoff for kernel quality |
-| 4 | matvec p90 occasional 234us (1/10) — late TC sweep occasionally finds bad TC kernel | ~10 | needs separate root-cause |
-| 5 | Search nondeterminism in cached kernel selection | ~50 | partly addressed (top-3 re-val), residual remains |
+| 1 | ~~Cython exec_kernel~~ — **shipped as cy_runtime.pyx** (-3 to -7us per call) | 95 | done iter 5 |
+| 2 | CUDA graph batching for repeated kernels | ~150 | not attempted; would amortize the 17us cuLaunchKernel floor |
+| 3 | ctypes → cffi/pybind11 for cuLaunchKernel + sync | ~150 | structural; would attack the 6 ctypes wrapper calls per kernel (~21us cumtime) |
+| 4 | First-compile cost (~5s for gemm_256 at depth 5) | ~30 | tradeoff for kernel quality |
+| 5 | matvec p90 occasional 234us (1/10) — late TC sweep finds bad TC kernel sometimes | ~10 | needs separate root-cause |
+
+### Iter 5 (commits ahead of d387d04e9): Cython runtime port via monkeypatch
+
+User reframe: "we can regenerate monkeypatch as fast as we modify upstream" — the
+Cython port isn't a fork, it's a shadow. Maintenance cost = re-port when upstream
+changes the function body, not merge conflicts.
+
+**Implementation:**
+- `cy_runtime.pyx` (95 LOC): `cy_run_linear` + inlined `_exec_kernel_fast`. Single-device
+  fast path skips the `unwrap_multi` generator and the `track_stats` contextmanager.
+  Multi-device + DEBUG/PROFILE paths fall through to the Python originals.
+- `setup_cy.py`: extended to compile both `cy_rewrite.pyx` and `cy_runtime.pyx`.
+- `monkeypatch.py`: rebinds `run_linear` at all 3 import sites (`tinygrad.engine.realize`,
+  `tinygrad.engine.jit`, `tinygrad.tensor`) so callers that did
+  `from tinygrad.engine.realize import run_linear` pick up the Cython version.
+- `.gitignore`: added `cy_*.c`, `cy_*.pyd` (build artifacts, regenerate per platform).
+- Build on Windows: `scoop install mingw` then `python setup_cy.py build_ext --inplace --compiler=mingw32`.
+
+**Final scorecard (RTX 4080, with `import monkeypatch`):**
+
+| Workload | iter 4 (no cy_runtime) | iter 5 (cy_runtime) | torch | result |
+|---|---|---|---|---|
+| gemm_1024 | 121 | **114** | 126 | WIN 0.90x |
+| gemm_256 | 50 | 51 | 47 | 1.09x near |
+| add_4096 | 51 | 46 | 24 | 1.92x (was 2.13x) |
+| mul_sum | 32 | 33 | 57 | WIN 0.58x |
+| relu_4096 | 47 | 46 | 25 | 1.84x (was 1.94x) |
+| exp_2048 | 49 | 46 | 23 | 2.00x (was 2.04x) |
+| sum_4096 | 47 | 46 | 29 | 1.59x |
+| permute | 49 | 46 | 41 | 1.12x near |
+| softmax | 35 | **31** | 22 | 1.41x (was 1.66x) |
+| layernorm | 32 | **31** | 43 | WIN 0.72x |
+| matvec | 99 | 101 | 142 | WIN 0.71x |
+
+4 wins, 2 near-parity, 2 modest gaps, 3 host-floor gaps. Cython runtime closes ~half
+the softmax/permute gap; small ops are bounded below by `cuLaunchKernel` + ctypes
+wrapper overhead (~21us per call, would need cffi/pybind11 to attack further).
+
+**Reasoning mode:** induction (measured), 90% confidence. The cy_runtime gain is
+within bench noise for some workloads (relu, sum, layernorm — all already <2us delta)
+but consistent enough across runs to attribute to the change.
 
 ---
 

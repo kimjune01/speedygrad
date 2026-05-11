@@ -11,6 +11,11 @@ notebooks
 *.txt
 build
 !examples/tinychat/assets/cdn.jsdelivr.net/npm/purecss@3.0.0/build/
+
+# Cython build artifacts — regenerate via: python setup_cy.py build_ext --inplace
+cy_*.c
+cy_*.html
+cy_*.pyd
 /dist
 *.egg-info
 /env
