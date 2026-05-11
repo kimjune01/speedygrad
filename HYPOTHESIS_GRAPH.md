@@ -1632,6 +1632,94 @@ The headline now reads: **speedygrad fp16 1B at 147 tok/s, 1.53x slower than lla
 
 ---
 
+### Iter 10c-cont v3 (this session): GPU/host post-fix decomposition + memoize-walk monkeypatch lands +17%, total session +64%
+
+**Question.** Now that the counter.realize() fix has shifted the gap from 35/65 GPU/host to ~50/50, where exactly does the remaining 2351us live, and what's the realistic squeezed floor?
+
+**Probe 1: fresh nsys trace post-fix** (`prework/cuda-parity/bench_for_nsys.py` + `sg3_kern_node.csv` + `sg3_api_sum.csv`).
+
+Speedygrad GPU per decode token (median basis, 91 forwards = 36 prefill + 5 burn + 50 decode):
+
+| Kernel | mean × calls/forward | per-forward |
+|---|---|---|
+| r_512_16_512_512_4_4 (FFN W1 gate) | 134us × 16 | **2144us** |
+| r_1024_16_2_512 (FFN W2 down) | 52us × 16 | 836us |
+| r_32064_16_4_128 (output proj, tied embedding) | 794us × 1 | 794us |
+| r_64_8_32_(start_pos+1) (attention out × V) | 240us × 16 | 240us |
+| r_32_2_16_32_32_4 (W_O proj) | 14us × 16 | 230us |
+| r_256_16_8_32_4 (post-attn proj) | 14us × 16 | 230us |
+| r_8_32_2_16_128 (Q proj fused w/ RMSNorm) | 122us × 16 | 122us |
+| r_4_32_2_16_2_2_128 (K/V + RoPE + cache write) | 102us × 16 | 102us |
+| Other small | — | ~500us |
+| **Speedygrad GPU per token** | | **~5200us** |
+
+**Post-fix gap decomposition:**
+
+| | speedygrad | llama.cpp | gap |
+|---|---|---|---|
+| GPU per decode token | ~5200us | ~3700us | **+1500us (~64%)** |
+| Host per decode token | ~1615us | ~764us | **+850us (~36%)** |
+| Total decode wall | 6815us | 4464us | **+2351us** |
+
+GPU gap by category (speedygrad − llama.cpp per token):
+- Matmul (FFN W1/W2/proj/output): ~+850us
+- Attention (Q×K^T + softmax + A×V): ~+280us
+- Other (small element-wise, argmax tail): ~+335us
+
+**Probe 2 + 3: implement memoize-walk monkeypatch and measure end-to-end.**
+
+In-process instrumented A/B (`prework/cuda-parity/probe_memoize_walk.py`):
+
+| | apply per call | decode_p50 | apply % of wall |
+|---|---|---|---|
+| A original walk | 563us | 6351us | 8.9% |
+| B memoize-walk | 110us | 6235us | 1.8% |
+| delta | **−453us (−80.5%)** | **−115us (−1.8%)** | |
+
+Cache stats: 99.4% hit rate over 9240 lookups, 221 cached entries. Apply cost dropped 80% as predicted; in-process wall improvement was much smaller (instrumentation overhead competed with savings).
+
+**End-to-end canonical bench** with memoize-walk applied to monkeypatch.py:
+
+```
+                            decode_us_p50   decode_tps  prefill_ms  vs llama.cpp
+Today's session start              9569         104.5       176.1       2.14×
++ counter.realize() (v2)           6815         146.7        89.4       1.53×
++ memoize-walk (v3)                5829         171.6        41.9       1.30×
+```
+
+**Memoize-walk lands +17% throughput on top of counter.realize().** Total session win: **+64% throughput, 1.80× → 1.30× of llama.cpp** (vs the iter 9 baseline of 1.80×).
+
+The end-to-end win was MUCH bigger than the in-process A/B suggested. In the clean bench (no instrumentation overhead), the full apply-cost reduction translates to wall improvement. The instrumented A/B's −1.8% was an artifact of the timing wrapper.
+
+**Memoize-walk applied** at `monkeypatch.py:64-105` (~40 LOC). Cache key is `id(uop)`, value is `frozenset(uop.toposort())`. UOps are hashconsed so cache is naturally bounded by the model's UOp footprint.
+
+**Known limitation: cache leak.** Each decode token creates ~1 fresh UOp that gets a new cache entry. Over 1000 decode tokens, cache grows by ~1000 entries (each a small frozenset). Acceptable for current bench scope; future improvement would weak-ref the cache or evict on GC of source UOp. At 1M tokens this would matter (~10M cache entries).
+
+**Updated squeeze map (post v3):**
+
+| Squeeze | LOC | Risk | Wall saving | New decode | New tps | New ratio |
+|---|---|---|---|---|---|---|
+| Today's start | — | — | — | 9569us | 104.5 | 2.14× |
+| + counter.realize() (v2 ✓) | 1 | none | −29% | 6815us | 146.7 | 1.53× |
+| + memoize-walk (v3 ✓) | 40 | low | −14% | 5829us | 171.6 | 1.30× |
+| + online-softmax (frontier #2) | ~200 | medium | ~−5-12% | 5129-5579us | 179-195 | 1.14-1.24× |
+| + matmul codegen wins | unknown | hard | ~−5-15% | 4529-5379us | 186-220 | 1.02-1.20× |
+| **Theoretical squeezed floor** | | | | **~4500-5000us** | **~200-220** | **~1.0-1.10×** |
+
+The remaining 1300-1500us gap is dominated by GPU kernel quality. Realistic floor for "pure tinygrad framework without writing C++ kernels" is **1.10-1.20× of llama.cpp**, achievable with online-softmax + matmul codegen tuning. Beating llama.cpp is not on the table without becoming llama.cpp.
+
+**Headline.** Speedygrad fp16 1B at **172 tok/s, 1.30× slower than llama.cpp**. Two complete fixes this iter: counter.realize in bench (1 line) + memoize-walk in monkeypatch.py (40 lines). Both fell out of probe-driven understanding. Remaining gap is GPU kernel work, characterized and ranked.
+
+**Carry (methodology).**
+
+1. **In-process instrumented A/B can dramatically understate end-to-end wins.** Instrumented showed −2%, canonical showed −14%. When an instrumented A/B shows a smaller win than the underlying mechanism predicts, run the canonical bench before concluding the prediction was wrong.
+
+2. **Probe-driven optimization had a high return this iter.** 5+ probes, 30-60 min each, total session +64% throughput. The probes also produced a complete GPU/host decomposition that scopes future work cleanly. The ratio of "probe time : measured win" was favorable because each probe sharpened the next.
+
+3. **Lazy graph systems accumulate dead history at unexpected places.** The RNG counter was the most dramatic example. The same pattern could appear anywhere a "feedback" tensor doesn't realize between updates. When adopting tinygrad-like lazy systems, periodic realize-this-feedback-chain hygiene should be in the design contract.
+
+---
+
 **Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |
