@@ -54,6 +54,11 @@ ptx_matcher = PatternMatcher([
   # upcast to float32 all the ops that don't support half
   (UPat(doesnt_support_half, dtype=dtypes.half, name="x"),
     lambda x: (UOp(x.op, dtypes.float32, tuple(vv.cast(dtypes.float32) for vv in x.src), x.arg).cast(dtypes.half))),
+  # PTX has no direct cvt.f16.bf16 / cvt.bf16.f16 — round-trip through f32. Same goes for any bf16 ALU.
+  (UPat(Ops.CAST, dtypes.float16, src=(UPat.var("a", dtypes.bfloat16),)),
+    lambda a: a.cast(dtypes.float32).cast(dtypes.float16)),
+  (UPat(Ops.CAST, dtypes.bfloat16, src=(UPat.var("a", dtypes.float16),)),
+    lambda a: a.cast(dtypes.float32).cast(dtypes.bfloat16)),
   # load/store bool -> uint8
   (UPat(Ops.LOAD, dtypes.bool, src=(UPat(dtype=dtypes.int64),), name="x", allow_any_len=True),
    lambda x: UOp(x.op, dtypes.uint8, x.src[0:1] + ((x.src[1].cast(dtypes.uint8),) if len(x.src) >= 2 else ()) + x.src[2:]).cast(dtypes.bool)),
@@ -165,10 +170,12 @@ class PTXRenderer(Renderer):
   barrier = "bar.sync\t0;"
   types: dict[DType, str] = { dtypes.int8: "s16", dtypes.int16: "s16", dtypes.int32: "s32", dtypes.int64: "s64",
                               dtypes.uint8: "u16", dtypes.uint16: "u16", dtypes.uint32: "u32", dtypes.uint64: "u64",
-                              dtypes.float16: "f16", dtypes.float32: "f32", dtypes.float64: "f64", dtypes.bool: "pred" }
+                              # PTX has no `.reg .bf16` — bf16 values live in `.b16` registers and "bf16" is only a
+                              # type qualifier on cvt/arith instructions. Storage type is "b16"; cast type is "bf16".
+                              dtypes.float16: "f16", dtypes.bfloat16: "b16", dtypes.float32: "f32", dtypes.float64: "f64", dtypes.bool: "pred" }
 
   mem_types: dict[DType, str] = {**types, dtypes.int8: "s8", dtypes.uint8: "u8", dtypes.bool: "u8", dtypes.float16: "b16"}
-  cast_types: dict[DType, str] = {**types, dtypes.int8: "s8", dtypes.uint8: "u8"}
+  cast_types: dict[DType, str] = {**types, dtypes.int8: "s8", dtypes.uint8: "u8", dtypes.bfloat16: "bf16"}
 
   def render_kernel(self, kernel, function_name, bufs, regs, uops) -> str:
     def fmt(line): return line if line[0]=="$" else "\t" + line.replace(" ", "\t" if len(line.split(" ")[0]) > 7 else "\t\t", 1)

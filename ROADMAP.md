@@ -125,7 +125,7 @@ iter 8.1 closed the prefill gap from 16.4x to 4.4x by JIT-ing the start_pos=0 pa
 
 **Open before v1.0:**
 - **Prefill remaining 4.4x gap** is per-token forward latency, not host overhead — closing it needs batched seqlen>1 forward through JIT (frontier item #9, but smaller than originally scoped). Required before claiming v1.0 against long-context workloads where prefill dominates wall time.
-- **bf16 not supported in PTXRenderer** (frontier #10). Workaround: pre-convert weights on disk via `prework/cuda-parity/convert_bf16_to_fp16.py`. Recurring blocker for iter 9 architecture coverage (Mistral, Qwen also bf16).
+- ~~**bf16 not supported in PTXRenderer**~~ — FIXED iter 8.2. bf16 weights load natively; the disk conversion script is no longer required (kept for users who want to skip the lazy cast). Unblocks iter 9 architectures (Mistral, Qwen, Gemma).
 - Single-script repro (`python infer_llama.py "Once upon a time"`) — not yet packaged. Bench scripts work but the demo-grade script is missing.
 - Sampling utilities (top-k, top-p, temperature) — already in `examples/llama3.py:144`, not separately verified.
 - KV cache correctness — verified by bit-identical 25-token output; long-output regression suite missing.
