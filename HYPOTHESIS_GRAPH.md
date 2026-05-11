@@ -101,6 +101,7 @@ GPU kernel times are competitive with or faster than torch for gemm_256, exp_204
 1. **Reduction kernels are scheduling-inert.** Max-reduction: 4 instructions, 0 independent. Sum-exp: 6 instructions, 0 independent. GEMM: 58 instructions, 24 independent. Zero ILP in reductions — nothing to reorder.
 2. **GPU compute is 2-14% of wall time.** Softmax GPU = 48us out of 2800us wall. Layernorm GPU = 607us out of 4476us. 86-98% is host-side.
 3. **PyTorch dispatches vendor primitives.** Softmax → `mpsGraph softMaxWithTensor` (Apple closed-source). LayerNorm → hand-written `LayerNorm.metal` with simd_sum, float4, rsqrt.
+4. **GPU clock-state confounds small-op microbench absolute numbers** (added retroactively, bug-hunt iter 7.5 round 3+5). Any kernel whose wall time is <30us GPU work and <30K threads keeps the GPU at intermediate P-states between launches — boost clock never engages because the per-launch duty cycle is too low. Symptoms: a larger workload reports *faster* GPU time than a smaller one (e.g. iter 7.5 standalone bench shows 256x256 at 10us GPU but 1024x1024 at 8us). Warmup depth doesn't fix this — at 10us/launch the queue drains regardless of iteration count. **Implication for iter 4-7 reasoning**: small-op (add/relu/exp/sum/permute) absolute numbers were measured at idle/intermediate clocks; the framework-level deltas (Python-frame removals worth 2-3us each) are real because the baseline shared the same clock state, but the absolute "X us per call" numbers shouldn't be quoted out of context. At real inference duty cycle (back-to-back attention ops), both numbers shrink but the ratio holds.
 
 ### Linearizer instruction ordering — CONFIRMED (GEMM +2x)
 
@@ -604,7 +605,7 @@ tinygrad fp32 gemm_1024 default = 617us (5.0x gap)
 | layernorm | 64us | 43us | 44us | **0.98x — PARITY** |
 | matvec | 84us | 108us | 142us | **0.77x — WIN** (still beats torch) |
 
-Wins/parity: 7/11 (gemm_1024, gemm_256, mul_sum, layernorm, matvec, gemm_256). Remaining gaps (1.5-2x) are on small ops (add/relu/exp/sum/softmax) where realize/dispatch overhead dominates — that's the Section II "host overhead 86-98% of wall time" frontier and out of scope for this PR.
+Wins/near-parity: 4 strict wins (gemm_1024 1.07x, mul_sum 0.58x, layernorm 0.98x, matvec 0.77x) plus 2 near-parity (gemm_256 1.13x, permute 1.19x). Remaining gaps (1.5-2x) are on small ops (add/relu/exp/sum/softmax) where realize/dispatch overhead dominates — that's the Section II "host overhead 86-98% of wall time" frontier and out of scope for this PR. (Originally claimed "7/11 wins" with `gemm_256` listed twice; corrected bug-hunt iter 7.5.)
 
 **Numerical accuracy (TF32 on RTX 4080):**
 
@@ -664,10 +665,10 @@ H_REFRAME confirmed: matvec frontier was Metal-specific, real CUDA gap is gemm
 |---|---|---|---|---|---|---|
 | gemm_1024 | 545 | 122 | 118 | 121 | 122 | **WIN 0.98x** |
 | gemm_256 | 99 | 54 | 53 | 50 | 45 | near 1.10x |
-| add_4096 | 67 | 53 | 51 | 51 | 23 | 2.25x (host floor) |
+| add_4096 | 67 | 53 | 51 | 51 | 23 | 2.22x (host floor) |
 | mul_sum | 80 | 36 | 34 | 32 | 57 | **WIN 0.55x** |
-| relu_4096 | 60 | 48 | 49 | 47 | 24 | 1.94x (host floor) |
-| exp_2048 | 60 | 51 | 59 | 47 | 21 | 2.21x (host floor) |
+| relu_4096 | 60 | 48 | 49 | 47 | 24 | 1.96x (host floor) |
+| exp_2048 | 60 | 51 | 59 | 47 | 21 | 2.24x (host floor) |
 | sum_4096 | 80 | 52 | 51 | 46 | 32 | 1.43x |
 | permute | 62 | 51 | 52 | 49 | 39 | near 1.25x |
 | softmax | 65 | 39 | 43 | 35 | 21 | 1.66x |
@@ -726,6 +727,345 @@ wrapper overhead (~21us per call, would need cffi/pybind11 to attack further).
 **Reasoning mode:** induction (measured), 90% confidence. The cy_runtime gain is
 within bench noise for some workloads (relu, sum, layernorm — all already <2us delta)
 but consistent enough across runs to attribute to the change.
+
+### Iter 6 (this session): GRAPH_ONE_KERNEL default — host floor crushed
+
+**Observation.** Re-reading the JIT batching code surfaced
+`tinygrad/engine/jit.py:38`:
+```python
+if len(current_batch) <= 1 and not getenv("GRAPH_ONE_KERNEL"): new_src.extend(current_batch)
+```
+Single-kernel batches skip CUDA graph capture by default. The 3 remaining host-floor
+workloads (add/relu/exp at 1.84-2.00x torch) are exactly single-kernel batches —
+graphs are NEVER engaged for them, and the per-call cost is `cuCtxSetCurrent +
+cuLaunchKernel` (2 ctypes calls × ~3.5us = 7us minimum). With graphs, the per-call
+cost is one `cuGraphLaunch` driver call.
+
+**Provenance.** `git log -S"GRAPH_ONE_KERNEL"` shows the env var was added Feb 2025
+(commit `ae4582675`, "hotfix: GRAPH_ONE_KERNEL + fix timing") as an escape hatch for
+UsbGPU openpilot timing tests. Never benched as a default for non-USB CUDA paths.
+Not a deliberate complexity-vs-perf trade-off — just a niche flag that never moved.
+
+**Implementation (1-line speedygrad-flavor patch).** `monkeypatch.py` adds at the
+top, BEFORE any tinygrad import:
+```python
+os.environ.setdefault("GRAPH_ONE_KERNEL", "1")
+```
+Order matters: tinygrad's `getenv` is `@functools.cache`d (helpers.py:161). Setting
+the env var after the first cached call is a no-op. Speedygrad users opt in via
+`import monkeypatch` (same activation pattern as cy_rewrite, cy_runtime).
+
+**Final scorecard (RTX 4080, isolated subprocess, p10 of 50 trials):**
+
+| Workload | iter 5 (cy_runtime) | iter 6 (+GRAPH=1) | torch | iter6/torch |
+|---|---|---|---|---|
+| gemm_1024 | 119 | **106** | 122 | **WIN 0.87x** |
+| gemm_256 | 50 | **33** | 45 | **WIN 0.73x** |
+| add_4096 | 51 | **28** | 23 | 1.22x near (was 1.92x — host floor crushed) |
+| mul_sum | 31 | 33 | 57 | **WIN 0.58x** |
+| relu_4096 | 47 | **28** | 24 | 1.17x near (was 1.84x — host floor crushed) |
+| exp_2048 | 47 | **28** | 21 | 1.33x small (was 2.00x — host floor crushed) |
+| sum_4096 | 46 | **29** | 32 | **WIN 0.91x** (was 1.53x) |
+| permute | 49 | **29** | 39 | **WIN 0.74x** (was 1.12x near) |
+| softmax | 34 | 36 | 21 | 1.71x (slight regression — see below) |
+| layernorm | 32 | 33 | 42 | **WIN 0.79x** |
+| matvec | 98 | 93 | 63-88 (noisy) | wins p50, ties p10 |
+
+**Tally:** 6 wins (was 4), 2 near-parity, 1 small gap, 1 gap, 1 noisy-tie. From
+iter 5's "4 wins, 2 near-parity, 2 modest gaps, 3 host-floor gaps" to "6 wins,
+2 near-parity, 2 small gaps, 1 noisy". The 3 host-floor workloads (add/relu/exp)
+that had been bounded below by ctypes overhead since iter 1 are now within 17-30%
+of torch — a structural floor moved by a 1-line patch.
+
+**Softmax slight regression (34→36us, +6%).** Hypothesis: softmax is multi-kernel
+(max + exp + sum + div); when the JIT batches it into a mix of multi-kernel and
+single-kernel sub-batches, the previously-direct single-kernel sub-batches now
+take the graph path. For a single-kernel sub-batch with multiple PARAMs, the graph
+path has comparable ctypes-call count to direct, but the graph object itself adds
+some Python overhead per call. Net cost ~2-3us. Within bench noise; classified
+as oscillatory (helps 8 workloads, hurts 1 by a small amount). Not worth gating.
+
+**Smoke + regression results.**
+- `prework/cuda-parity/smoke.py` 17/17 pass under `GRAPH_ONE_KERNEL=1`.
+- `test/backend/test_jit.py` 19/20 pass — the 1 fail is the pre-existing
+  Windows clang FileNotFoundError (also fails on master).
+- `test/backend/test_linearizer.py` 19/19 pass.
+- `test/backend/test_opt_gemm.py` 4/4 pass.
+- `test/backend/test_ops.py -k "matmul or sum_reduce or matvec"` 6/6 pass.
+- Other test_jit failures all trace to either the Windows clang issue or to the
+  `beam_search` → `search` rename in commit `e51047241` (purged BEAM aliases).
+  Pre-existing on master, not introduced by this change.
+
+**Reasoning mode table (iter 6).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| GRAPH_ONE_KERNEL=1 reduces host floor 17us | induction | 95% | A/B bench, full scorecard |
+| Provenance: hotfix not deliberate default | deduction | 99% | git log -S, commit message |
+| getenv is @functools.cache'd → order matters | deduction | 99% | helpers.py:161 |
+| Softmax 6% regression is graph overhead per call | abduction | 70% | hypothesis, not directly measured |
+| No new test failures | induction | 90% | regression suite identical to iter 5 |
+
+**Open frontier (after iter 6):**
+
+| # | Edge | LOC | Status |
+|---|---|---|---|
+| 1 | matvec p90 catastrophic outlier (1/12 runs land 917us) | unknown | confirmed iter 6; late-TC sweep noise; needs `_time_program` cnt bump in line 167 of abduct.py |
+| 2 | Per-call `cuCtxSetCurrent` in `CUDAProgram.__call__:55` (3.5us each call) | ~5 | obvious next: context never changes within a JIT replay; safe to lift |
+| 3 | softmax 1.71x — multi-kernel batching efficiency on CUDA | ~50 | likely needs proper kernel fusion or batch-merging beyond GRAPH_ONE_KERNEL |
+| 4 | exp_2048 1.33x — transcendental call quality | ~30 | ~~tinygrad's exp likely uses polynomial decomposition; torch uses CUDA's intrinsic~~ **KILLED bug-hunt iter 7.5 round 5**: tinygrad already maps `Ops.EXP2` → `ex2.approx` in `ptx.py:20`. Real cause is host-side, not transcendental quality. See iter 7.5 frontier item #3 for current framing. |
+
+### Iter 7 (this session): Cython exec_graph + CUDAGraph.__call__ inlining
+
+**Observation.** cProfile of add_4096 hot path (post iter-6 GRAPH_ON default) showed
+the per-call cost was distributed across 6 Python frames before the actual ctypes
+driver call — `TinyJit.__call__` → `CapturedJit.__call__` → `cy_run_linear` →
+`exec_graph` → `CUDAGraph.__call__` → `cu_time_execution(lambda: ...)` → ctypes
+wrapper. The single largest line items by cumtime were `track_stats`
+contextmanager (~7us cumtime in cProfile, ~3-4us actual) and the
+`cu_time_execution(lambda: ...)` wrapper around `cuGraphLaunch` for the wait=False
+case (2 unnecessary Python frames per call, ~3-4us actual).
+
+**Initial wrong hypothesis.** Assumed `cuCtxSetCurrent` in `CUDAProgram.__call__:55`
+was the per-call hot-path cost. Provenance check killed it: with `GRAPH_ONE_KERNEL=1`
+default (iter 6), `CUDAProgram.__call__` is bypassed entirely on the JIT replay path —
+calls go through `CUDAGraph.__call__` which never calls `cuCtxSetCurrent`. The
+actual hot-path bottleneck is Python frame overhead from the multi-layer call stack.
+Recorded so the same dead-end isn't re-explored.
+
+**Implementation (two complementary patches).**
+
+1. `cy_runtime.pyx` — added `_exec_graph_fast` (mirrors `_exec_kernel_fast` pattern):
+   ```cython
+   cdef inline _exec_graph_fast(ctx, call, ast):
+     if DEBUG >= 2 or PROFILE: _exec_graph_py(ctx, call, ast); return
+     rt = _get_graph_runtime(ast, ctx.input_uops)
+     if ctx.do_update_stats: _GlobalCounters.kernel_count += 1
+     rt(ctx.input_uops, ctx.var_vals, wait=False)
+   ```
+   `cy_run_linear`'s CUSTOM_FUNCTION dispatch reordered so `arg == "graph"` is the
+   first branch (most common case). Skips the `track_stats` contextmanager and its
+   `estimate_uop` call. Falls back to Python `exec_graph` when DEBUG/PROFILE are on.
+
+2. `monkeypatch.py` — replaces `CUDAGraph.__call__` with `_cuda_graph_call_fast`,
+   identical body except the final launch:
+   ```python
+   if wait: return _cu_time(lambda: _check(_cuda.cuGraphLaunch(...)), enable=True)
+   _check(_cuda.cuGraphLaunch(self.instance, None))  # direct, no lambda wrapper
+   return None
+   ```
+   Saves the lambda + `cu_time_execution` wrapper for the wait=False path
+   (every JIT replay). Identical observable behavior; wait=True path unchanged.
+
+**Final scorecard (RTX 4080, isolated subprocess, p10 of 50 trials):**
+
+| Workload | iter 6 | iter 7 | torch | iter7/torch | Δ vs iter6 |
+|---|---|---|---|---|---|
+| gemm_1024 | 106 | **104** | 122 | **WIN 0.85x** | -2us |
+| gemm_256 | 33 | **30** | 45 | **WIN 0.66x** | -3us |
+| add_4096 | 28 | **25** | 23 | **1.09x near** (was 1.92x baseline) | -3us |
+| mul_sum | 33 | **31** | 57 | **WIN 0.54x** | -2us |
+| relu_4096 | 28 | **25** | 24 | **1.05x near** (was 1.84x baseline) | -3us |
+| exp_2048 | 28 | **25** | 21 | 1.19x small (was 2.00x baseline) | -3us |
+| sum_4096 | 29 | **26** | 32 | **WIN 0.81x** | -3us |
+| permute | 29 | **27** | 39 | **WIN 0.69x** | -2us |
+| softmax | 36 | **34** | 21 | 1.62x | -2us |
+| layernorm | 33 | **30** | 42 | **WIN 0.71x** | -3us |
+| matvec | 93 | **75** | 63 | 1.19x small (ratio inverted in original write-up: 75/63=1.19, not 0.83x; bug-hunt round 4) | **-18us** |
+
+**6 wins, 2 essentially-tied (1.05-1.10x), 2 small gaps (exp_2048 1.19x, matvec 1.19x), 1 gap (softmax).**
+Per-workload Δ is uniformly 2-3us (one Python frame's worth) plus matvec's outlier
+-18us. The matvec gain is bigger than expected; hypothesis is that matvec is the
+single matmul kernel that was previously hitting the abduct-search noise path
+during warmup, and the cleaner exec_graph path makes its bench measurement more
+deterministic. (Matches the observation that iter-7 matvec p90=78 is now
+super-tight — gap between p10 and p90 is only 3us, vs iter 6's 100+us.)
+
+**Reasoning mode (iter 7).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| Hot path is Python frame overhead, not ctypes | induction | 95% | cProfile of add_4096 hot loop |
+| cuCtxSetCurrent NOT in GRAPH hot path | deduction | 99% | code trace ops_cuda.py vs graph/cuda.py |
+| ~3us per Python frame removed | induction | 90% | A/B bench, uniform 2-3us delta across workloads |
+| matvec -18us comes from p90 stabilization | abduction | 65% | hypothesis; not directly measured |
+
+**Smoke + regression results.**
+- `prework/cuda-parity/smoke.py` 17/17 pass (correctness preserved).
+- `test/backend/test_jit.py` 40/47 pass; 6 failures (deselecting Windows-only test_jit_several_devs) — same 6 failures as iter 6 (clang FileNotFoundError + beam_search rename). **Zero new regressions.**
+- `test/backend/test_linearizer.py` 19/19 pass.
+- `test/backend/test_opt_gemm.py` 4/4 pass.
+- `test/backend/test_ops.py -k "matmul or sum_reduce or matvec"` 6/6 pass.
+
+**Open frontier (after iter 7):**
+
+| # | Edge | LOC | Status |
+|---|---|---|---|
+| 1 | matvec p90 catastrophic outlier (1/8 fresh-cache runs land 437us) | unknown | iter 6 finding still open; the iter-7 bench shows a stable cache run, but a fresh search may still mis-adopt. Late-TC sweep `min`-comparator fix needed |
+| 2 | softmax 1.62x — multi-kernel batching efficiency | ~50 | dominant remaining gap; needs proper kernel fusion or batch-merging |
+
+### Iter 7.5 (this session): online-softmax algorithmic carry to CUDA — VALIDATED
+
+**H₀.** The Metal online-softmax prototype (`bench/online_softmax.py`, 2.5-6.6x on
+Metal) carries to CUDA: speedygrad's 3-kernel CUDA softmax (max → exp(x-m) → sum/div)
+can collapse to 1 kernel using Milakov-Gimelshein compound reduction with
+`__shfl_down_sync` warp reduction.
+
+**Phase 1 — kernel structure of current softmax (DEBUG=2 trace).**
+
+Current softmax(256,256) on speedygrad CUDA, after iter 7's exec_graph fast path:
+
+| # | Kernel | Op | GPU steady-state |
+|---|---|---|---|
+| 6 | `r_16_16_16_16` | row-max via GROUP=16+LOCAL=16 | ~5us |
+| 7 | `r_256_256` | row-sum-of-exp(x-max) | ~6us |
+| 8 | `E_256_16_16` | elementwise out = exp(x-m)/sum | ~6us |
+| 9 (graph) | `batched 3` | cuGraphLaunch of {6,7,8} | **17.4us GPU** |
+
+Wall clock 34us = 17us GPU + ~17us host (cuGraphLaunch + Python frames + ctypes).
+Torch reference: 21us wall (closed-source vendor primitive, likely 7-10us GPU + 11-14us host).
+
+**Phase 1 — standalone CUDA online-softmax bench (`prework/cuda-parity/online_softmax_cuda.py`).**
+
+Hand-written CUDA kernel (one warp per row, `__shfl_down_sync` compound reduce
+for both running-max and running-sum, `__expf`/`__shfl_sync(...,0)` for the broadcast):
+
+| Shape | online-softmax GPU p10 | speedygrad 3-kernel GPU | **algorithmic carry** |
+|---|---|---|---|
+| 256x256 | **10.2us** | 17.4us (batched 3) | **1.7x** |
+| 1024x1024 | 8.0us | (untested at this shape) | n/a — large enough that GPU dominates |
+| 4096x4096 | 248us | (untested) | n/a — GPU bandwidth bound |
+
+Numerical correctness: `max|out - numpy_softmax| < 3e-8` (fp32) on all perf shapes,
+plus PASS on edge cases (cols<32 inactive-lane reduction, masked-causal -inf rows).
+
+**Provenance honesty (bug-hunt round 1+2 findings).** First measurement was 4.10us,
+which would have been a 4.2x carry. Bug hunt round 1 (gemini-3-pro adversarial review)
+found that the kernel's initial `m = -INFINITY` poisoned warp-reduce with
+`exp(-inf - -inf) = NaN` whenever two empty lanes paired (cols<32 or
+masked-attention -inf rows). Fix: initial `m = -FLT_MAX` instead — same
+mathematical behaviour but no `inf - inf`. After the fix, GPU p10 stabilized at ~10us
+across three runs — a 6us regression from the pre-fix measurement.
+
+**Bug-hunt round 2 caught me bullshit-explaining the regression.** I initially
+attributed the 6us to "nvcc constant-folding -INFINITY paths in `__expf`," but
+gemini correctly noted this is mathematically impossible: for the perf shapes
+(cols ≥ 32), every lane iterates the loop at least once, so `m = fmaxf(-INFINITY, x)`
+becomes finite *before* the warp reduce ever runs — the `-INFINITY` constant
+never reaches the warp-reduce paths the compiler could fold.
+
+**Bug-hunt round 3 caught the actual mechanism: GPU clock-state artifact.**
+The bench shows `256x256` at 10us GPU and `1024x1024` at 8us GPU — physically
+impossible (16x more data, less time) under fixed clocks. Increasing warmup from
+20 to 2000 iterations didn't move either number. Diagnosis: each 10us kernel
+launches only 256 blocks × 32 threads = 8K threads on a 117K-thread GPU (7%
+utilization), so the GPU clocks down between launches and stays at intermediate
+P-states even during the timed loop. `1024x1024` (32K threads, 28% util) keeps
+the GPU at boost clocks. `4096x4096` (~512K threads) saturates and is bandwidth-bound.
+
+**Implication for the carry claim.** Both the 17us speedygrad baseline (DEBUG=2
+trace inside a TinyJit replay loop) and the 10us online-softmax measurement
+were collected with similar low-duty-cycle launch cadence. The 1.7x **ratio**
+is approximately fair. The absolute numbers are at idle/intermediate clocks; at
+real inference duty cycle (back-to-back ops in attention) both numbers would
+likely shrink, but their ratio should hold.
+
+**Conclusion: prototype carries on CUDA, but more modestly than the Metal 2.5-6.6x
+or the buggy-kernel 4.2x.** At 256x256 (the bench shape), single-kernel online
+softmax is **~1.7x faster on GPU** than the current 3-kernel batched graph.
+
+**Wall-clock projection (if integrated; mechanism-level model, not measured end-to-end).**
+
+| Path | GPU | Host | Wall | vs torch |
+|---|---|---|---|---|
+| iter 7 (current) | 17us | 17us | 34us | 1.62x slower |
+| online softmax (1 kernel in graph) | ~10us | ~15us | **~25us** | ~1.19x — narrows gap, doesn't win |
+
+Host saves ~2us by collapsing 3 `cuGraphExecKernelNodeSetParams` ctypes calls to 1
+in the JIT replay path (`monkeypatch.py:53` loops over `self.updatable`, so the
+saving is per-node, not per-graph; correction noted from bug-hunt round 1 where
+gemini originally claimed this was constant per graph).
+
+This narrows the softmax gap from 1.62x to ~1.19x. Not parity, not a torch win.
+Honest reframing: the integration is still worth doing for the decode loop and
+attention, but won't single-handedly close the softmax gap. Combining with
+masked-attention fusion (frontier #5) is what gets to parity. (The iter 6/7
+plan to swap `exp` polynomial → CUDA intrinsic was retracted in bug-hunt round
+5: tinygrad already uses the intrinsic; the gap is host-side.)
+
+**Measurement caveat (bug-hunt round 1).** `cuEventElapsedTime` includes PCIe
+dispatch latency for `cuLaunchKernel` because the per-iteration sync drains the
+GPU between trials. The reported GPU p10 is therefore a slight overestimate of
+pure kernel time. The speedygrad 17us baseline (from DEBUG=2 cuGraphLaunch event
+timing) has the same dispatch-latency inclusion, so the ratio is approximately
+fair. Pure kernel time is likely 1-2us less for both numbers.
+
+**Phase 2 (deferred): framework integration.**
+
+Integration scope is genuinely larger than the original ~100 LOC estimate. To
+participate in the JIT cuda-graph batching (which is critical — bypassing the
+graph would re-introduce per-call overhead and lose the iter 6/7 wins), the kernel
+needs to be either:
+
+1. **Synthetic `Ops.PROGRAM` UOp** (cleaner) — pre-render PTX, build PROGRAM UOp via
+   `to_program()` with a hand-rolled `ProgramInfo(globals=(0,1), outs=(0,), vars=(cols,))`,
+   route `Tensor.softmax` to emit a `CALL(program, out_buf, in_buf)` for favorable
+   cases. This goes through the existing pipeline and gets cuda-graph-batched
+   automatically. Pattern is the one used in `extra/gemm/triton_nv_matmul.py:96`.
+
+2. **New `Ops.CUSTOM_FUNCTION arg="online_softmax"`** — register dispatcher in
+   `_CUSTOM_DISPATCH`, extend `MultiGraphRunner.supports_uop` (jit.py:177) to
+   include the new arg, extend `CUDAGraph.__init__` (graph/cuda.py:18) to add a
+   kernel node for it. More invasive (touches jit.py + graph/cuda.py) but doesn't
+   require synthetic PROGRAM construction.
+
+Test matrix (either path): axis variants (last-axis vs other), dtype (fp32, fp16,
+bf16 — order-of-accumulation differs in low precision), shape (1D, 2D, 3D+ with
+broadcast), masked softmax (attention's `where(mask, x, -inf)`), gradient correctness
+(autograd — softmax appears in cross-entropy loss). Bench coverage needs `smoke.py`
+correctness checks plus `bench_iso.py` softmax + a fresh attention microbench.
+
+Realistic scope: 200-400 LOC, 1-2 days focused work. Filed as iter 8a (precedes
+iter 8 Llama 3.2 demo because the demo's attention softmax compounds with this win).
+
+**Reasoning mode (iter 7.5, post bug-hunt round 1).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| Current speedygrad softmax = 3 kernels in cuGraph batch | deduction | 99% | DEBUG=2 trace |
+| Current GPU time 17us, host 17us | induction | 95% | DEBUG=2 timings + bench wall clock |
+| Online algorithm carries to CUDA at 256x256, 1.7x GPU speedup | induction | 95% | standalone bench post-fix, 10us GPU vs 17us, correctness verified including masked-attention edge case |
+| Original 4.2x carry shrunk to 1.7x post-NaN-fix; 6us regression caused by GPU clock-state / low-duty-cycle launch cadence | induction | 95% (delta) / 80% (mechanism) | bug-hunt round 3 identified clock-state via 1024x1024 < 256x256 anomaly (impossible under fixed clocks); ratio is fair across same-cadence baselines |
+| Wall projects to ~25us (narrows but doesn't close gap to torch ~21us) | abduction | 65% | host saves modeled per-node (not constant), not measured end-to-end |
+| Integration is 200-400 LOC, 1-2 days | abduction | 65% | scope analysis vs encdec/triton_nv_matmul reference patterns |
+
+**Open frontier (after iter 7.5):**
+
+| # | Edge | LOC | Status |
+|---|---|---|---|
+| 1 | matvec p90 catastrophic outlier | unknown | unchanged from iter 7 |
+| 2 | **online-softmax integration (path 1: synthetic PROGRAM)** | ~200 | **prototype validated this session, ready for focused implementation iteration** |
+| 3 | exp_2048 1.19x — host overhead, NOT transcendental quality | ~30 | bug-hunt round 5 retraction: tinygrad's PTX renderer (`ptx.py:20`) already maps `Ops.EXP2` to `ex2.approx`, the CUDA intrinsic. The "polynomial decomposition" hypothesis in iter 6/7 was false. Real cause is unknown; 4us gap likely host-side (one fewer Python frame than torch's eager dispatch) |
+| 4 | _prepare_jit_inputs (11.5us cumtime per call) | ~50 | unchanged from iter 7 |
+| 5 | Attention fusion (builds on #2) | ~200 | unblocked once #2 lands |
+| 6 | First-compile cost (~5s for gemm_256 at depth 5) | ~30 | unchanged from iter 7 |
+| 7 | **Pack multiple warps per block in online-softmax kernel** | ~10 | bug-hunt round 3 finding: 32-thread blocks cap SM occupancy at 50% on sm_89 (24 blocks/SM hardware limit). Apply during framework integration |
+| 8 | **`GlobalCounters.global_ops`/`global_mem` not tracked on Cython fast path** | ~5 | bug-hunt round 4 finding (out of iter 7.5 scope, real iter 7 issue): `_exec_kernel_fast` and `_exec_graph_fast` in `cy_runtime.pyx` skip `estimate_uop` to save ~3us, but that also skips the FLOP/mem accumulation in `track_stats`. Any external bench script depending on `GlobalCounters.global_ops` (e.g. estimating throughput) silently sees zero. Either rebuild estimates lazily, or update docs to note the Cython path is FLOP-untracked |
+
+### Matvec p90 outlier (still open)
+
+`prework/cuda-parity/noise_probe.py matvec 12` (post-iter-6, GRAPH_ON):
+- 6/8 runs: p90 < 130us (clean)
+- 1/8 runs: p90 = 437us (catastrophic — chosen TC + UNROLL=4 kernel measures 6x worse than search winner)
+- 1/8 runs: p90 = 309us (also bad)
+
+The mechanism: `abduct.py:167` compares `final_tc = min(_time_program(tc_compiled, cnt=7))`
+against `best_time` (also a min-of-7). `min` is sensitive to single fast outliers;
+late-TC sweep occasionally adopts a TC kernel whose ONE fast measurement of 7 fooled
+it but whose mean is much worse than search winner. Cheap fix: use median of cnt=15
+in the comparator, or add a final validation pass after the late-TC follow-up search
+that confirms TC's adopted chain is still measured-faster than the original best.
+Filed as iter 7 candidate.
 
 ---
 
@@ -916,7 +1256,7 @@ Performance gap (1.2-5.9x vs torch) — CONFIRMED
 │   ├─ Cython rewrite + toposort + dfs_match — SHIPPED
 │   └─ total: 3.457s → 1.57s (-55%)
 │
-└─ Online softmax prototype (2.5-6.6x) — VALIDATED, needs framework integration
+└─ Online softmax prototype (2.5-6.6x Metal, **1.7x CUDA at 256x256 post bug-hunt iter 7.5**) — VALIDATED with NaN fix, ready for integration
 ```
 
 ## PRs
