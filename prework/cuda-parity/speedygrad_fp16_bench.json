@@ -1,0 +1,19 @@
+{
+  "framework": "speedygrad",
+  "model_path": "C:\\Users\\junekim\\.cache\\llama32-1b-fp16",
+  "device": "CUDA",
+  "dtype": "fp16",
+  "prompt": "Hello.",
+  "prompt_len": 37,
+  "n_new_tokens": 25,
+  "runs": 5,
+  "n_decode_samples": 120,
+  "decode_us_p10": 7883.4000014467165,
+  "decode_us_p50": 10019.800000009127,
+  "decode_us_p90": 14750.699992873706,
+  "decode_tps_p50": 99.80239126520381,
+  "decode_tps_p10": 67.79339288868431,
+  "decode_tps_p90": 126.84882155116901,
+  "prefill_ms_p50": 704.7840000013821,
+  "generated_text_run0": "Hello. Is there something I can help you with or would you like to chat?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nI can provide"
+}

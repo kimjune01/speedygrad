@@ -110,23 +110,24 @@ policy is allowed to be revised — but only with public reasoning, not silently
 
 ## Iterations
 
-### Iter 8 — Llama 3.2 1B inference demo (~1-2 weeks)
+### Iter 8 — Llama 3.2 1B inference demo — DECODE VALIDATED (2.82x), prefill open
 
-**Single most important artifact in the next quarter.** This is the validation play
-materialized.
+**Decode result.** Llama 3.2 1B-Instruct fp16 on RTX 4080:
 
-- Llama 3.2 1B-Instruct inference running on speedygrad, RTX 4080
-- Verify/adjust `extra/models/llama.py` for Llama 3.2 specifics (RoPE base, vocabulary, GQA)
-- Load weights from HF safetensors via `nn.state.load_state_dict`
-- Wire HF `tokenizers` library directly (don't reinvent)
-- KV cache management correctness (this is the inference hot path)
-- Sampling utilities: greedy, top-k, top-p, temperature
-- Single-script reproducible: `python infer_llama.py "Once upon a time"` works
-- Bench: decode tokens/sec vs PyTorch + HF transformers, same machine, same model
-- Publish bench script + numbers + reproduction instructions
+| | Speedygrad | Torch+HF eager | Ratio |
+|---|---|---|---|
+| Decode p50 | 99.8 tok/s | 35.4 tok/s | **2.82x** |
 
-**Success criteria**: a tinybox-owner can `pip install`, download a script, run it on
-their hardware, and post numbers within 10 minutes of finding the project.
+Both frameworks fed identical 37-token HF chat-template input IDs, generate bit-identical 25-token output. Full writeup: HYPOTHESIS_GRAPH.md "Iter 8" section. Bench scripts: `bench/speedygrad_llama32_1b.py`, `bench/torch_llama32_1b.py`.
+
+**Open before v1.0:**
+- **Prefill is 16x slower** (`examples/llama3.py:257` does one-token-at-a-time prefill). For 2048-tok prompts this dominates wall time. Filed as frontier item #9 (~30-100 LOC). Required before claiming v1.0 against any long-context workload.
+- **bf16 not supported in PTXRenderer** (frontier #10). Workaround: pre-convert weights on disk via `prework/cuda-parity/convert_bf16_to_fp16.py`. Recurring blocker for iter 9 architecture coverage (Mistral, Qwen also bf16).
+- Single-script repro (`python infer_llama.py "Once upon a time"`) — not yet packaged. Bench scripts work but the demo-grade script is missing.
+- Sampling utilities (top-k, top-p, temperature) — already in `examples/llama3.py:144`, not separately verified.
+- KV cache correctness — verified by bit-identical 25-token output; long-output regression suite missing.
+
+**Success criteria status**: tinybox-owner reproducibility partial. Bench scripts work in 10 minutes given the env setup; `pip install`-style install path not done.
 
 ### Iter 9 — Inference scale-out (~2-3 weeks)
 

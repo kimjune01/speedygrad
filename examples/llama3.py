@@ -223,7 +223,7 @@ def build_transformer(model_path: Path, model_size="8B", quantize=None, scale_dt
       weights = convert_from_gguf(weights, MODEL_PARAMS[model_size]["args"]["n_layers"])
     weights = fix_bf16(weights)
 
-    with Context(BEAM=0):
+    with Context(SEARCH=0):
       # quantize
       if quantize == "float16": weights = {k:v.cast(quantize).contiguous() for k,v in weights.items()}
       elif quantize is not None:

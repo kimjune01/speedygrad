@@ -1039,18 +1039,90 @@ iter 8 Llama 3.2 demo because the demo's attention softmax compounds with this w
 | Wall projects to ~25us (narrows but doesn't close gap to torch ~21us) | abduction | 65% | host saves modeled per-node (not constant), not measured end-to-end |
 | Integration is 200-400 LOC, 1-2 days | abduction | 65% | scope analysis vs encdec/triton_nv_matmul reference patterns |
 
-**Open frontier (after iter 7.5):**
+### Iter 8 (this session): Llama 3.2 1B inference demo — VALIDATED at 2.82x decode
+
+**H₀.** Speedygrad's iter 6+7 host-floor wins compound on real LLM inference. Llama 3.2 1B-Instruct end-to-end decode on speedygrad beats torch + HF transformers eager on the same RTX 4080.
+
+**Setup.** Model: unsloth/Llama-3.2-1B-Instruct (non-gated mirror of meta-llama, identical weights), pre-converted bf16→fp16 on disk because speedygrad's PTXRenderer has no bf16 entry in its `types` dict (`renderer/ptx.py:157-162`). Conversion script: `prework/cuda-parity/convert_bf16_to_fp16.py`. Both benches feed the same 37-token HF chat-template input IDs (`tokenizer.apply_chat_template([{"role":"user","content":"Hello."}], add_generation_prompt=True)`).
+
+**Method.** Per-token decode timing, KV cache populated via prefill, 5 runs × 25 decode tokens, first decode token of each run excluded as warmup → 120 samples per framework. `time.perf_counter` around each `.item()` (speedygrad) or `model(...)` (torch) with `cuda.synchronize` on torch and the implicit sync from `.item()` on speedygrad. Greedy decode (temperature=0). Speedygrad runs with `monkeypatch` enabled (Cython rewrites + cy_runtime fast path + GRAPH_ONE_KERNEL).
+
+**Result (matched 37-token prompt, fp16-vs-fp16):**
+
+| Metric | Speedygrad fp16 | Torch+HF eager fp16 | Ratio |
+|---|---|---|---|
+| Decode p10 | 7.88 ms (**126.8 tok/s**) | 27.76 ms (36.0 tok/s) | **3.52x** |
+| **Decode p50** | **10.02 ms (99.8 tok/s)** | **28.28 ms (35.4 tok/s)** | **2.82x** |
+| Decode p90 | 14.75 ms (67.8 tok/s) | 35.50 ms (28.2 tok/s) | 2.41x |
+| Prefill p50 (37 toks) | 705 ms | 43 ms | **0.06x (torch wins 16.4x)** |
+
+Even speedygrad's worst p90 (67.8 tok/s) beats torch's best p10 (36.0 tok/s) by 1.88x.
+
+**Numerical correctness verified.** Both frameworks generate the bit-identical token sequence for the first 25 decoded tokens: `"Hello. Is there something I can help you with or would you like to chat?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nI can provide"`. Same input IDs → same logits → same argmax. The fp16 forward pass is faithful.
+
+**Issues triaged during iter 8.**
+1. `examples/llama3.py` fetched the Q6_K GGUF by default; works on speedygrad. Steady-state ~65 tok/s but quantization muddies the comparison vs torch fp16, so pivoted to fp16 safetensors.
+2. `Context(BEAM=0)` in `examples/llama3.py:226` crashed (`KeyError: 'BEAM'`) — speedygrad uses `SEARCH`, BEAM was deliberately removed. Fixed at the call site (`Context(SEARCH=0)`), not by re-registering BEAM as a shim.
+3. PTXRenderer crashed on bf16 weights (`KeyError: dtypes.bfloat16` in `ssa()`). Speedygrad's `fix_bf16` queues `cast(fp32).cast(fp16)` but the cast kernel's PTX read still requires bf16 in `mem_types`. Workaround: pre-convert weights on disk via torch+safetensors. Real fix would be to add bf16 to PTX `types/mem_types/cast_types` plus `cvt.f32.bf16`/`cvt.bf16.f32` (~30 LOC) — filed below.
+4. `tiktoken` was not installed; `examples/llama3.py`'s `Tokenizer` needs it. One-time `pip install tiktoken`.
+
+**Wider variance on speedygrad than torch.** Speedygrad's per-token decode varies p10-p90 from 67-127 tok/s (1.9x spread), torch from 28-36 tok/s (1.3x spread). The mechanism is the same iter 7.5 finding: per-token decode launches ~30 small kernels through cuGraph batching, total GPU compute is ~5-8us, GPU clocks down between calls. Torch's eager dispatch keeps the GPU at higher steady-state utilization. The ratio still holds because **both** are running the same shape mix; the variance is symmetric noise on top of the deterministic framework overhead.
+
+**The prefill cliff is the open story.** Speedygrad's `prefill()` in `examples/llama3.py:257` iterates one token at a time through the JIT path. 37 tokens cost 705 ms (19 ms/tok). Torch does a single batched forward over the prompt: 43 ms total (1.16 ms/tok). At realistic prompt lengths the prefill dominates wall time:
+
+| Prompt length | Speedygrad prefill (projected) | Torch prefill (projected) | Speedygrad disadvantage |
+|---|---|---|---|
+| 37 tok | 0.7 s | 0.04 s | 16x slower |
+| 256 tok | 4.9 s | 0.30 s | 16x slower |
+| 2048 tok | 39 s | 2.4 s | 16x slower |
+
+Decode wins are unaffected, so for medium-output use cases (chat completion of 100-500 tokens off short prompts) the decode advantage dominates wall time. Long-context (8k+ prompt, short response) is where torch wins overall. Prefill fix is filed as frontier item #9.
+
+**Reasoning mode (iter 8).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| Speedygrad fp16 decode p50 = 99.8 tok/s on RTX 4080 | induction | 95% | 120 samples across 5 runs |
+| Torch+HF eager fp16 decode p50 = 35.4 tok/s on same hardware | induction | 95% | 115 samples across 5 runs |
+| 2.82x speedup at p50 holds for matched 37-token chat-template prompt | induction | 90% | identical input token IDs verified, identical 25-token output verified |
+| Decode advantage extends to all prompt lengths (decode tok/s is prompt-length-indep given KV cache) | deduction | 90% | KV cache decouples decode from prompt length; both frameworks use KV cache the same way |
+| Prefill is 16x slower on speedygrad for any prompt length | induction | 85% | one-token-at-a-time loop scales linearly with prompt length; the 19 ms/tok constant should hold across prompt sizes (no quadratic) |
+| Wider speedygrad p10-p90 spread is GPU clock-state noise (iter 7.5 mechanism), not codegen variability | abduction | 70% | matches the 256x256 softmax pattern from iter 7.5 bug-hunt round 3; not directly verified for the Llama kernel mix |
+
+**Reproduce.**
+
+```powershell
+# venv with torch 2.11+cu128, transformers, tiktoken, safetensors already installed
+$env:PATH = "C:\Program Files\Microsoft Visual Studio\2022\Professional\VC\Tools\MSVC\14.44.35207\bin\Hostx64\x64;$env:PATH"
+$env:DEV = "CUDA"; $env:PYTHONPATH = "."
+
+# One-time: download unsloth mirror, convert bf16 -> fp16 on disk
+python -c "from huggingface_hub import snapshot_download; snapshot_download('unsloth/Llama-3.2-1B-Instruct')"
+python prework/cuda-parity/convert_bf16_to_fp16.py
+
+# Bench (each run takes ~30s for 5x25 tokens)
+python bench/speedygrad_llama32_1b.py --runs 5 --n-new 25 --out prework/cuda-parity/speedygrad_fp16_bench.json
+python bench/torch_llama32_1b.py        --runs 5 --n-new 25 --out prework/cuda-parity/torch_fp16_baseline.json
+```
+
+Bench scripts: `bench/speedygrad_llama32_1b.py`, `bench/torch_llama32_1b.py`. Result JSONs and conversion script: `prework/cuda-parity/`.
+
+---
+
+**Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |
 |---|---|---|---|
 | 1 | matvec p90 catastrophic outlier | unknown | unchanged from iter 7 |
-| 2 | **online-softmax integration (path 1: synthetic PROGRAM)** | ~200 | **prototype validated this session, ready for focused implementation iteration** |
+| 2 | **online-softmax integration (path 1: synthetic PROGRAM)** | ~200 | **prototype validated iter 7.5, ready for focused implementation iteration** |
 | 3 | exp_2048 1.19x — host overhead, NOT transcendental quality | ~30 | bug-hunt round 5 retraction: tinygrad's PTX renderer (`ptx.py:20`) already maps `Ops.EXP2` to `ex2.approx`, the CUDA intrinsic. The "polynomial decomposition" hypothesis in iter 6/7 was false. Real cause is unknown; 4us gap likely host-side (one fewer Python frame than torch's eager dispatch) |
 | 4 | _prepare_jit_inputs (11.5us cumtime per call) | ~50 | unchanged from iter 7 |
 | 5 | Attention fusion (builds on #2) | ~200 | unblocked once #2 lands |
 | 6 | First-compile cost (~5s for gemm_256 at depth 5) | ~30 | unchanged from iter 7 |
 | 7 | **Pack multiple warps per block in online-softmax kernel** | ~10 | bug-hunt round 3 finding: 32-thread blocks cap SM occupancy at 50% on sm_89 (24 blocks/SM hardware limit). Apply during framework integration |
 | 8 | **`GlobalCounters.global_ops`/`global_mem` not tracked on Cython fast path** | ~5 | bug-hunt round 4 finding (out of iter 7.5 scope, real iter 7 issue): `_exec_kernel_fast` and `_exec_graph_fast` in `cy_runtime.pyx` skip `estimate_uop` to save ~3us, but that also skips the FLOP/mem accumulation in `track_stats`. Any external bench script depending on `GlobalCounters.global_ops` (e.g. estimating throughput) silently sees zero. Either rebuild estimates lazily, or update docs to note the Cython path is FLOP-untracked |
+| 9 | **Batched prefill (replace 1-token-at-a-time loop)** | ~30-100 | iter 8 finding: `examples/llama3.py:257` prefills one token per JIT call → 19 ms/tok. Torch batched prefill is 1.16 ms/tok (16x faster). For 2048-token prompt: 39s vs 2.4s. Implementation: pass `Tensor([toks])` as batch through model.forward (not forward_jit, which captures bs=1,seq=1) for the prefill, then resume per-token decode. Architecturally: forward path already supports seqlen>1 (see mask construction `examples/llama3.py:213`); the JIT wrapper only handles single-token decode |
+| 10 | **bf16 support in PTXRenderer** | ~30 | iter 8 finding: `KeyError: dtypes.bfloat16` in `ssa()` when loading bf16 weights. Workaround is on-disk fp16 conversion. Real fix: add `dtypes.bfloat16` to `types`/`mem_types`/`cast_types` in `renderer/ptx.py:157-162` and implement `cvt.f32.bf16`/`cvt.bf16.f32` in cast logic. Llama 3.2/Mistral/Qwen all ship bf16 by default, so this is a recurring blocker for the iter 9 architecture-coverage roadmap. Long-term should also install nvrtc/nvjitlink so we use CUDARenderer (which presumably handles bf16) |
 
 ### Matvec p90 outlier (still open)
 

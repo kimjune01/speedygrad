@@ -1,0 +1,18 @@
+{
+  "model": "unsloth/Llama-3.2-1B-Instruct",
+  "device": "NVIDIA GeForce RTX 4080",
+  "dtype": "fp16",
+  "prompt": "Hello.",
+  "prompt_len": 37,
+  "n_new_tokens": 25,
+  "runs": 5,
+  "n_decode_samples": 115,
+  "decode_us_p10": 27763.89999780804,
+  "decode_us_p50": 28282.899991609156,
+  "decode_us_p90": 35497.50000820495,
+  "decode_tps_p50": 35.35705321224752,
+  "decode_tps_p10": 28.170997951091156,
+  "decode_tps_p90": 36.01799459294084,
+  "prefill_ms_p50": 43.20729999744799,
+  "generated_text_run0": "Hello. Is there something I can help you with or would you like to chat?assistant\n\nI can provide"
+}
