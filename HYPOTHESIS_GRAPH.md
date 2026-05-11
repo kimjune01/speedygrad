@@ -1424,6 +1424,66 @@ $env:PYTHONPATH = "."
 
 ---
 
+### Iter 10c-cont (this session): inner-cost breakdown reveals one-tensor concentration
+
+**Question.** The 1.98 ms / decode-token cost is one number; what's its inner shape? Is it dominated by 168 outer-loop frames (→ Cython port the harness), by per-tensor DAG-walk depth (→ memoize), or by `topovisit`'s dict pattern (→ different fix entirely)? Without this, picking memoize-vs-Cython is a guess.
+
+**Probe.** `prework/cuda-parity/probe_apply_map_inner.py` reimplements `_apply_map_to_tensors` with per-stage and per-tensor `perf_counter_ns` instrumentation, sampled only on steady-state decode (50 tokens, prefill+burn skipped). Records: stage breakdown (walk / sink / substitute / assign), per-tensor walk time grouped by `t.uop.op`, slowest-tensor identity per call.
+
+**Result.** Per-call mean (steady-state decode):
+
+| Stage | us | % |
+|---|---|---|
+| walk (all_tensors topovisit loop) | 2094 | 98.6% |
+| sink (UOp.sink construction) | 4 | 0.2% |
+| substitute | 24 | 1.1% |
+| assign (.uop reassignment loop) | 1 | 0.0% |
+
+Per-tensor walk time, grouped by `t.uop.op`:
+
+| op | total_us | count | mean_us | share |
+|---|---|---|---|---|
+| **AFTER** | **71277** | **50** | **1426** | **73.6%** |
+| RESHAPE | 22083 | 6600 | 3.35 | 22.8% |
+| BUFFER | 3005 | 1650 | 1.82 | 3.1% |
+| COPY | 514 | 100 | 5.14 | 0.5% |
+
+**Slowest tensor per call: identical across all 50 calls.** `AFTER shape=(2,) dtype=uint dev=CUDA new_uops=1613` — one Tensor whose `.uop` adds 1613 UOps to the in-scope cache per call (median walk 1643us, max 3084us). The next-largest per-tensor walk is RESHAPE at ~3-5us each.
+
+**Identity.** This is the captured JIT return Tensor (`CapturedJit.ret` from `tinygrad/engine/jit.py:289`). After first capture (cnt=1), the JIT freezes a reference to the model's output Tensor. On subsequent decode calls (cnt>=2), `self.captured(input_buf_uops, var_vals)` returns the *same* `self.ret` Tensor — its `.uop` is a deep AFTER chain holding the entire forward-pass UOp graph. It returns False from `visitor` every call (it's dead-weight per the 99.8% stat below) so `_apply_map_to_tensors` never reassigns its `.uop`. **Same UOp graph, walked from scratch every decode token.**
+
+**Dead-weight = 99.8% of walk cost.** Only 1 of 168 tensors per call returns True from the visitor (the per-iteration input tok_tensor). The other 167 contribute 99.8% of the walk time discovering they don't reach any `applied_map` key — work the killed skip-walk gate was aimed at.
+
+**Reasoning mode (iter 10c-cont).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| 98.6% of `_apply_map_to_tensors` cost is the walk; sink/substitute/assign are negligible | observation | 99% | direct ns-resolution stage timing across 50 calls |
+| 73.6% of walk cost is one tensor (AFTER, shape=(2,) uint) | observation | 99% | per-tensor breakdown, identical slowest-tensor identity in all 50/50 calls |
+| That tensor is `CapturedJit.ret` from the JIT replay path | deduction | 90% | (a) shape=(2,) uint matches sampling output (sampled token + ?), (b) AFTER UOp depth (1613 new UOps) matches a frozen full-forward-pass DAG, (c) same identity across all 50 calls is consistent with a frozen capture artifact, (d) Tensor.realize would have collapsed the AFTER chain if it were on the writeable path. Confirmation would need an `id(t)` print or stack walk through the JIT layer; deferred |
+| The deep-AFTER tensor's `.uop` is stable across decode tokens (not reassigned by `_apply_map_to_tensors`) | deduction | 95% | (a) it returns False from visitor (dead-weight stat), so the assign loop skips it; (b) JIT replay path doesn't construct new return Tensors — it returns the captured one |
+| Per-UOp memoization (`frozenset(uop.toposort())` keyed by UOp identity, UOps are hashconsed) would skip ~96% of the walk on stable tensors after first call | hypothesis | 80% | mechanism is sound (cache automatic via UOp interning, no invalidation logic needed because cache key changes when UOp identity changes) but unconfirmed without a prototype measurement |
+
+**Implications for the iter 11 fix shape.**
+
+- **The fix is NOT 168 outer-loop overhead reduction** (Cython-port the harness). The 168-tensor outer loop is real but small (~100us in aggregate Python frame overhead at most); the win there is bounded.
+- **The fix IS one-tensor-deep-walk avoidance.** The memoize-walk candidate from iter 10c is correctly shaped: cache per-UOp DAG sets, look up `applied_keys.isdisjoint(cached_set)` per tensor. The deep AFTER tensor's cache hits 49 of 50 calls; its 1426us amortizes to ~30us across 50 decode tokens. The cheap RESHAPE walks also cache (model-weight tensors have stable .uop), additional ~22% reclaimed.
+- **Estimated impact** (one-call cost basis, applied to all 49 cache-hit calls): walk drops from 2094us to ~50us. `_apply_map_to_tensors` total drops from 2094us to ~80us. Decode wall drops from 7.83ms to ~5.87ms = **~1.32x of llama.cpp** (vs current 1.80x).
+- **Risk:** lower than the killed skip-walk gate. Semantics identical to the original walk (no skip — just cached). UOps are interned so cache is naturally bounded by the model's UOp footprint (~2187 unique UOps per call, totally stable across calls).
+
+**Carry (methodology).** "Optimize by understanding first" was load-bearing here. Without the per-tensor breakdown, both candidate fixes (memoize-walk, Cython-port-topovisit) had similar prior probability. With the breakdown, Cython-port is dead (it would speed up 168 outer-loop calls by 2-3x but the cost is in *one* of those calls). Memoize-walk is the right shape because the dominant cost is repeated work on a stable graph. Difference: ~5x bounded vs ~26x bounded estimated impact.
+
+**Reproduce.**
+
+```powershell
+$env:PYTHONPATH = "."
+.venv\Scripts\python prework\cuda-parity\probe_apply_map_inner.py 2>$null
+```
+
+**Status.** Reserved per session direction ("we are optimizing but only by understanding first, not just squeezing a rock"). Memoize-walk is now well-shaped for iter 11 implementation but unbuilt this session. Next probe candidates: confirm `CapturedJit.ret` identity directly (5 LOC instrumentation), or measure prefill's inner shape (which has different `_apply_map_to_tensors` invariants — multiple calls per prefill token, may have different dominant-tensor pattern).
+
+---
+
 **Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |
