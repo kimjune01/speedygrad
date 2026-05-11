@@ -1344,6 +1344,86 @@ $env:PYTHONPATH = "."
 
 ---
 
+### Iter 10c (this session): JIT-replay gate-skip approach KILLED by gemini, raw cost confirmed, frontier #9 reframed
+
+**H₀.** A monkeypatch.py rebind of `tinygrad.tensor._apply_map_to_tensors` can take a fast path when called from the JIT-input realize chain — skipping the O(|all_tensors|) topovisit walk by inspecting only the input tensor's UOp shape (a "fresh leaf" check: COPY/RESHAPE/CAST/EXPAND over BUFFER with Ops.UNIQUE source).
+
+**Adversarial review (gemini-3-pro-preview, this session).** H₀ FALSIFIED on a structural bug: the gate inspects the input tensor's *ancestors* (sources) but isolation requires checking *descendants* (consumers). Concrete failure case Gemini constructed:
+
+```python
+tok_tensor = Tensor([[last_tok]], device="CUDA")
+derived = tok_tensor + 1.0       # derived.uop has tok_tensor.uop as a source
+out = model(tok_tensor, ...)      # Layer B passes (sees fresh COPY→BUFFER→UNIQUE).
+                                  # Fast path skips updating derived.uop.
+                                  # derived.uop now points at orphaned pre-callify UOps.
+                                  # Silent tensor-identity corruption for a user-held ref.
+```
+
+UOps don't carry parent pointers; the `all_tensors` walk *is* the reverse-edge scan. No O(1) gate based on the input tensor's source-DAG can detect user-held descendants. The Layer-A-context-flag + Layer-B-shape gate is dead.
+
+Full review at `prework/cuda-parity/gemini_iter10c_review.md`. Gate design (the artifact reviewed) at `prework/cuda-parity/iter10c_gate_design.md`.
+
+**H₁ (re-measurement).** Gemini also questioned the 1.5-2 ms / decode token impact estimate on methodological grounds: cProfile inflates tight Python lambda loops 5-15x, not the 3x factor used to deflate iter 10's cumtime number. Re-measure with raw `perf_counter_ns` (no cProfile) before sizing further work.
+
+**Probe.** `prework/cuda-parity/probe_apply_map.py` rebinds `_apply_map_to_tensors` with a phase-tagged ns-resolution timing wrapper, runs prefill (36 toks) + decode_burn (5 toks) + steady-state decode (50 toks).
+
+**Result — H₁ confirmed: ~1.98 ms / decode token raw, 25.3% of decode wall.**
+
+| Phase | calls | total | per-call | per-token |
+|---|---|---|---|---|
+| load | 148 | 1006 ms | 6.8 ms | n/a |
+| prefill (36 tok) | 118 | 423 ms | 3.59 ms | **11.75 ms** |
+| decode_burn (5 tok) | 5 | 10.6 ms | 2.12 ms | n/a |
+| **decode steady (50 tok)** | **50** | **99.0 ms** | **1.98 ms** | **1.98 ms** |
+
+Decode wall = 7.83 ms / token (instrumented). `_apply_map_to_tensors` share = 25.3%. The 1.5-2 ms estimate from iter 10's cProfile/3x deflation was correct — actual cProfile inflation factor here was 6.78 / 1.98 = **3.42x**, not gemini's 5-15x. (Carry: cProfile inflation depends on per-frame Python work; for `_apply_map_to_tensors` the inner `topovisit` is dict-heavy but does real work per frame, putting it at the low end of typical cProfile inflation. Gemini's range was too wide for this case but the *direction* of the critique — re-measure raw — was correct and load-bearing.)
+
+**Frontier #9 reframe (load-bearing new finding).** Prefill `_apply_map_to_tensors` cost is **11.75 ms / prefill-token** (3.59 ms × 118 calls / 36 prefill tokens — multiple calls per prefill token from `.realize()` plus internal). Iter 8 quoted prefill at 19 ms / prefill-token total; the probe localizes ~62% of it (11.75 / 19) to a single function. **Frontier #9 (batched prefill) collapses 36 separate JIT calls into 1, reclaiming nearly all of this cost.** TTFT win is bigger than iter 8 sized.
+
+**Open question for iter 11.** Two viable shapes for closing the decode 25.3%:
+
+| Shape | LOC | Risk | Approach |
+|---|---|---|---|
+| memoize `_apply_map_to_tensors` walk | ~50 | LOW | cache `frozenset(uop.toposort())` per UOp (UOps are hashconsed → naturally bounded), replace topovisit with `applied_keys.isdisjoint(cached_set)` per tensor. Correctness identical to walk; speedup from O(DAG) → O(1) per tensor after first call |
+| Cython-port `topovisit` | ~30 | LOW | extend `cy_rewrite` (`UOp.toposort` and `UOp.dfs_match` already there); same algorithm in C. Bounded ~2-3x speedup on the walk itself. Also benefits prefill |
+
+Both lower-risk than the dead skip-walk approach, both bounded ~5-10x improvement on the 1.98 ms cost. Either would put speedygrad fp16 1B decode at ~6 ms / token = **~1.31x of llama.cpp** (vs current 1.80x).
+
+**Reasoning mode (iter 10c).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| The Layer-A + Layer-B gate corrupts user-held derived tensor identity | deduction | 99% | Gemini's concrete code snippet; structural read of `_apply_map_to_tensors` confirms the "skipped tensor stays at pre-callify UOp" semantics |
+| `_apply_map_to_tensors` raw cost is 1.98 ms / decode token | observation | 99% | direct `perf_counter_ns` measurement on 50 steady-state decode tokens, instrumented (not cProfile) |
+| `_apply_map_to_tensors` is 11.75 ms / prefill token | observation | 99% | same probe, prefill phase |
+| cProfile inflation factor for this code path is ~3.4x | observation | 95% | 6.78 ms (iter 10 cProfile cumtime/50) ÷ 1.98 ms (this probe) |
+| Memoization or Cython-port is the right next direction (vs skip-walk) | hypothesis | 85% | structural argument: no O(1) gate exists without parent pointers; both alternatives preserve walk semantics so correctness is bounded by the original implementation |
+| Frontier #9 batched prefill TTFT win is bigger than iter 8 sized | deduction | 90% | 11.75 ms `_apply_map_to_tensors` per prefill token is fixed-cost-per-JIT-call; batched prefill turns N JIT calls into 1, recovers (N-1)/N of that cost |
+
+**Methodology guardrails added this session.**
+
+1. **When an estimate from cProfile cumtime survives an adversarial-review challenge to the deflation factor, re-derive raw via `perf_counter_ns` instrumentation before sizing follow-up work.** Iter 10c's gemini round flagged the cProfile/3x estimate; the probe confirmed it (3.42x actual) but the discipline is what mattered — without the probe, a gemini "5-15x" rebuttal would have been just as unsupported as the original "3x" assumption. (Carry: numbers from cProfile cumtime are asymptotically informative for *attribution* but quantitatively unreliable. Both proponents and reviewers should re-derive from raw wall-clock before betting LOC on the estimate.)
+
+2. **An adversarial reviewer can be quantitatively wrong while qualitatively right.** Gemini's "5-15x cProfile inflation" range was wrong for this code path (actual: 3.4x). But its core critique — "you're guessing from profiling residue, do raw instrumentation" — was correct and load-bearing. Carry: weight the *direction* of the critique independently from the *magnitude* of any number the reviewer cites, especially when the reviewer is rebutting a number derived from the same artifact.
+
+3. **The "fast path bypasses the all_tensors walk" pattern, in any form that doesn't actually walk all_tensors, breaks user-callable composition.** Without parent pointers from UOp to consumer-Tensor, no source-DAG-only check can establish "no other live tensor references this UOp." Carry: any future "skip the walk" proposal in tinygrad needs to either (a) add reverse-edge tracking, (b) accept the walk and optimize *per-tensor* cost, or (c) restrict to non-user-callable code paths (e.g., internal-only entry points where the caller can prove isolation by construction).
+
+**Reproduce.**
+
+```powershell
+$env:PYTHONPATH = "."
+.venv\Scripts\python prework\cuda-parity\probe_apply_map.py 2>&1 | Select-Object -Last 30
+```
+
+**Strategic update.** Iter 10's headline (1.80x slower than llama.cpp) is unchanged. Iter 10c sharpens the *understanding* but does NOT prescribe a patch this iteration:
+
+- **Skip-walk approach is filed as dead.** Carrying it as a candidate would require adding UOp→Tensor reverse-edge tracking, which is a much bigger surface than the speedup justifies. Marked falsified.
+- **Memoize-walk and Cython-port-topovisit** are filed as candidates for iter 11+, but unbuilt. Sizing depends on understanding *why* the walk is expensive at the per-call level — e.g., is the cost dominated by the 168 outer-loop frames, by topovisit's dict-lookup pattern, or by per-tensor DAG-walk depth? The probe gives totals, not a breakdown. Before any patch, profile the inner cost distribution (per-tensor walk time, DAG depth distribution across the 168 tensors) so the optimization actually targets the dominant component.
+- **Frontier #9 (batched prefill)** is the cleanest available ship on a different axis (TTFT, not decode tps) and is now better-supported by the per-prefill-token `_apply_map_to_tensors` cost (11.75 ms / token). When ready to ship something, this is the lowest-risk candidate.
+- **Carry: optimize by understanding first, not by squeezing.** Iter 10c's gate design was a "squeeze" (skip the slow thing, hope the gate is right) and gemini killed it in one round. The probe gave a real number for the cost; the next step is understanding the *shape* of that cost, not picking a patch and building it.
+
+---
+
 **Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |
@@ -1351,7 +1431,7 @@ $env:PYTHONPATH = "."
 | 1 | matvec p90 catastrophic outlier | unknown | unchanged from iter 7 |
 | 2 | **online-softmax integration (path 1: synthetic PROGRAM)** | ~200 | **prototype validated iter 7.5, ready for focused implementation iteration** |
 | 3 | exp_2048 1.19x — host overhead, NOT transcendental quality | ~30 | bug-hunt round 5 retraction: tinygrad's PTX renderer (`ptx.py:20`) already maps `Ops.EXP2` to `ex2.approx`, the CUDA intrinsic. The "polynomial decomposition" hypothesis in iter 6/7 was false. Real cause is unknown; 4us gap likely host-side (one fewer Python frame than torch's eager dispatch) |
-| 4 | ~~_prepare_jit_inputs (11.5us cumtime per call)~~ — **iter 10 reframe**: the cost is in `_apply_map_to_tensors` walking `all_tensors` (~168 topovisit/decode-token, ~1.5-2 ms raw). See iter 10c below. Original 11.5us number was iter 7's cProfile snapshot before model weights populated `all_tensors`; with Llama 3.2 1B loaded the per-call cost is ~700x larger | unknown | **iter 10c open**: monkeypatch.py rebind of `tinygrad.tensor._apply_map_to_tensors` with a JIT-replay fast path. Risk: tensor identity for user-held references after realize. Adversarial review before patch |
+| 4 | ~~_prepare_jit_inputs (11.5us cumtime per call)~~ — **iter 10 reframe**: the cost is in `_apply_map_to_tensors` walking `all_tensors`. **iter 10c re-measurement**: 1.98 ms / decode token raw (25.3% of decode wall), 11.75 ms / prefill token raw. Confirms iter 10's 1.5-2 ms estimate (cProfile inflation factor 3.4x) | unknown | **iter 10c filed: skip-walk approach KILLED** by gemini (gate inspects sources, but isolation requires checking consumers — silent corruption case constructed). Memoize-walk and Cython-port-topovisit are open candidates for iter 11+, NOT yet patched. Need inner-cost-distribution probe before sizing |
 | 5 | Attention fusion (builds on #2) | ~200 | unblocked once #2 lands |
 | 6 | First-compile cost (~5s for gemm_256 at depth 5) | ~30 | unchanged from iter 7 |
 | 7 | **Pack multiple warps per block in online-softmax kernel** | ~10 | bug-hunt round 3 finding: 32-thread blocks cap SM occupancy at 50% on sm_89 (24 blocks/SM hardware limit). Apply during framework integration |
