@@ -1484,6 +1484,103 @@ $env:PYTHONPATH = "."
 
 ---
 
+### Iter 10c-cont v2 (this session): dominant tensor identified — it's the RNG counter, one-line fix lands −14.5% decode wall
+
+**Hypothesis (carried from iter 10c-cont v1).** The dominant tensor in the per-decode `_apply_map_to_tensors` walk is `CapturedJit.ret` (90% confidence by deduction; matches shape=(2,) uint and AFTER chain depth).
+
+**v2 probe (`prework/cuda-parity/probe_apply_map_inner_v2.py`).** Tags each live tensor by category (model_param / captured_ret / other) by id-comparing against `get_state_dict(model)` and `model.forward_jit.captured.ret`. Results:
+
+| category | op | total_us | count | mean_us | share |
+|---|---|---|---|---|---|
+| **other** | **AFTER** | **77059** | **50** | **1541** | **73.3%** |
+| model_param | RESHAPE | 21435 | 5700 | 3.76 | 20.4% |
+| model_param | BUFFER | 3299 | 1650 | 2.00 | 3.1% |
+| other | RESHAPE | 2630 | 850 | 3.09 | 2.5% |
+| other | COPY | 565 | 100 | 5.65 | 0.5% |
+| **captured_ret** | **RESHAPE** | **151** | **50** | **3.0** | **0.1%** |
+
+**Hypothesis FALSIFIED.** `CapturedJit.ret` is a RESHAPE tensor at 3 us/call — negligible. The dominant tensor is in the `other` category — same id across all 50/50 calls (`tensor_id=2609671165520`), AFTER op, shape=(2,) uint on CUDA.
+
+**v2.1 identification (`prework/cuda-parity/probe_dominant_tensor_id.py`).** Walks `all_tensors` for AFTER tensors with deep DAGs, dumps DAG composition and BUFFER leaves, and searches `model` recursively for matching id. Found:
+
+- Exactly ONE AFTER tensor with shape=(2,) uint, n_uops=1615
+- DAG has just 1 BUFFER leaf: shape=(2,) dtype=uint dev=PYTHON
+- **Identity search through `model` returned no match.** Tensor exists in `all_tensors` but is not reachable as a `model.*` attribute.
+- DAG composition: 456 ADD, 233 RESHAPE, 228 SHRINK, 228 PAD, 114 CMPLT, 114 CAST, **114 STORE, 114 AFTER** (equal counts strongly suggest 114 `.assign()` events on a single underlying buffer)
+
+**Identification.** The 114-STORE / 114-AFTER pattern + (2,) uint PYTHON BUFFER + global-but-not-on-model traces directly to `Tensor._device_rng_counters[device]` (`tinygrad/tensor.py:535`):
+
+```python
+@staticmethod
+def _next_counter(device:str, num:int) -> tuple[Tensor, Tensor]:
+    if device not in Tensor._device_seeds:
+      ...
+      Tensor._device_rng_counters[device] = Tensor([0, 0], device=device, dtype=dtypes.uint32, requires_grad=False)
+    counter = Tensor._device_rng_counters[device]
+    new_low = counter[0:1] + (num & 0xffffffff)
+    new_high = counter[1:2] + (num >> 32) + (counter[0] < (num & 0xffffffff))
+    counter.assign(new_low.cat(new_high))
+    ...
+```
+
+Each `_next_counter` call does `counter.assign(...)`, building an AFTER chain. For Llama 3.2 1B, `build_transformer` calls `_next_counter` once per random-weight-init: **114 weight tensors → 114 assigns → 114-deep AFTER chain on a never-realized counter**. The bench passes `temperature=0.0` so the JIT'd decode path uses `argmax` (no RNG, chain doesn't grow during decode), but the historical 114 `.assign`s are walked from scratch every decode token.
+
+**A/B verification (`prework/cuda-parity/probe_rng_counter_realize_v2.py`).** Single-model in-process: measure decode → call `Tensor._device_rng_counters['CUDA'].realize()` → measure decode again.
+
+| | counter chain | apply per call | decode p50 | apply share |
+|---|---|---|---|---|
+| A baseline | 1615 UOps | 2004 us | 7672 us | 26.1% |
+| **B counter.realize()** | **3 UOps** | **536 us** | **6557 us** | **8.2%** |
+| delta | −1612 UOps | **−1468 us (−73.3%)** | **−1115 us (−14.5%)** | |
+
+**One line.** `Tensor._device_rng_counters['CUDA'].realize()` collapses the AFTER chain to a single BUFFER. `_apply_map_to_tensors` cost drops 73.3% (matches the predicted share from the v2 categorization probe). Decode wall drops 14.5%. **No monkeypatch, no gate design, no skip-walk.**
+
+Headline: speedygrad fp16 1B decode = **6557 us / token = 152 tok/s** (was 124 tok/s). Vs llama.cpp 224 tok/s = **1.47x slower** (was 1.80x slower from iter 9). Closes ~40% of the iter 9 host gap with a one-line fix.
+
+**Reasoning mode (iter 10c-cont v2).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| `CapturedJit.ret` is NOT the dominant tensor | observation | 99% | direct id-comparison on slowest-tensor across 50/50 calls; captured_ret separately tagged at 3 us/call |
+| Dominant tensor is `Tensor._device_rng_counters['CUDA']` | deduction | 95% | (a) shape=(2,) uint matches the literal `Tensor([0, 0], device, dtype=uint32)` constructor; (b) PYTHON-device BUFFER leaf matches `Tensor.__init__` for list literals; (c) 114 STORE+AFTER pairs match 114 weight-init `.assign()` events (Llama 3.2 1B has ~114 random-init weight tensors per `get_state_dict`); (d) global-but-not-on-`model` matches a class-level dict; (e) A/B confirms — `realize()` on this exact tensor drops the cost as predicted |
+| One-line `counter.realize()` after load drops decode wall by 14.5% | observation | 99% | direct A/B measurement on a single model in one process; n=50 decode tokens per phase, p50 metric |
+| The same fix would help any tinygrad model that uses random weight init + JIT decode without RNG | hypothesis | 80% | mechanism is general (the counter is class-level and accumulates across all weight inits), but other models may have different parameter counts and different chain depths; need to measure per-workload |
+
+**Carry (methodology, this is a strong pattern).**
+
+1. **The "categorize then attribute" pattern.** Iter 10c-cont v1 quantified "73.6% of cost is one tensor" but didn't identify it. v2 added id-comparison against known model attributes — falsified the captured_ret hypothesis in one probe and re-localized to "other" (a category that holds 1 deep tensor + 19 cheap ones). v2.1 then DAG-decomposed the deep tensor and matched its UOp pattern (114 STORE+AFTER pairs, PYTHON leaf) against tinygrad's source. Three probes, each narrower than the last. **Each probe costs ~30 minutes; each one falsifies or sharpens the hypothesis. This is the right rate of probe-to-conclusion.**
+
+2. **A/B test with stale state in process is invalid.** v1 of the realize-test loaded TWO models in one Python process; Run B walked Run A's still-live tensors too, masking the realize win as a +128% regression. The fix was single-model, in-process A→realize→B. **Carry: when measuring "did fix X help?", make sure all_tensors size is constant across the comparison. Multiple model loads in one process is a noise source.**
+
+3. **The deepest UOp DAG in `all_tensors` may be a stale historical artifact, not active hot-path computation.** The RNG counter's 1615-UOp chain accumulated entirely during MODEL CONSTRUCTION (114 weight inits) and was never used during decode (temperature=0.0, no multinomial). It contributes 73% of the per-decode walk cost as pure dead history. **Carry: when a function is hot-path, scan `all_tensors` for stale-state Tensors (deep AFTER/STORE chains never realized) before optimizing the function. The function may be slow because it walks history that no one needs anymore.**
+
+4. **One-line fixes are valid optimization targets when they fall out of understanding.** "Reserve the monkeypatch" / "understand first" doesn't mean "no fix this session." It means "don't squeeze." The counter-realize fix is a direct mechanical consequence of identifying the dominant tensor — no gate design, no risk surface, no adversarial review needed. Carry: the right output of understanding-first is sometimes a one-line fix that nobody had to design.
+
+**Reproduce.**
+
+```powershell
+$env:PYTHONPATH = "."
+.venv\Scripts\python prework\cuda-parity\probe_apply_map_inner_v2.py 2>$null    # categorization
+.venv\Scripts\python prework\cuda-parity\probe_dominant_tensor_id.py 2>$null     # identification
+.venv\Scripts\python prework\cuda-parity\probe_rng_counter_realize_v2.py 2>&1    # A/B with realize
+```
+
+**Status.** Finding committed; fix application location TBD. Natural locations to apply the one-liner:
+
+- `bench/speedygrad_llama32_1b.py` — bench-only, scoped, easy to bisect
+- `examples/llama3.py` `build_transformer` — applies to all llama callers (infer_llama.py, etc.)
+- Tinygrad's `_next_counter` or `manual_seed` — most general, but wider change requiring care (the counter intentionally accumulates a chain so the rand kernel can read the latest value cheaply mid-graph; periodic realize is the right shape but needs a policy)
+
+The memoize-walk approach from iter 10c-cont v1 is now lower-priority. Even after counter-realize, `_apply_map_to_tensors` is still 536us/call (8.2% of wall) — memoize-walk could shave another ~400us by amortizing the 167 model-param walks across calls. But the headline gap closure is now from a one-line fix, not a 50-LOC monkeypatch. Worth measuring whether other models (different parameter counts, different RNG-use patterns) hit the same bottleneck.
+
+**Open follow-ups (probe-shaped, not patch-shaped).**
+
+- Are there OTHER deep-AFTER tensors in `all_tensors` we missed by filtering on shape=(2,) uint? (5 LOC: scan all_tensors for n_uops > 100, by category)
+- Does the same fix help on prefill? (Prefill uses 11.75 ms / token of `_apply_map_to_tensors`; counter chain doesn't grow during prefill since temperature=0.0, so the same realize should help proportionally)
+- Does this affect bf16 / int8 / nf4 quant variants of the model? They use different weight init patterns.
+
+---
+
 **Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |
