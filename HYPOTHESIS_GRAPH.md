@@ -1263,6 +1263,83 @@ Trace files, kernel CSVs, and Gemini review: `prework/cuda-parity/nsys_*.nsys-re
 
 ---
 
+### Iter 10 (this session): cuMemHostAlloc hypothesis falsified, real host culprit re-localized to `_apply_map_to_tensors`
+
+**H₀ (carried from iter 9 as iter 10b candidate).** speedygrad calls `cuMemHostAlloc` once per decode token (~1 ms/tok), driving most of the host gap. Fix would be an arena/per-size cache to reuse pinned host buffers, or eliminate the per-token host→device input copy.
+
+**Probe.** `prework/cuda-parity/probe_hostalloc.py` wraps `tinygrad.runtime.autogen.cuda.cuMemHostAlloc` with a counter+stack-sampler, splits counts by phase (load / prefill / decode), and runs Llama 3.2 1B with 36 prefill tokens and 50 decode tokens.
+
+**Result — iter 10b H₀ FALSIFIED.**
+
+| Phase | cuMemHostAlloc calls | Per token | Mechanism |
+|---|---|---|---|
+| Model load | 146 | n/a | weight buffer copyin (one per parameter chunk) |
+| Prefill (36 tokens) | 36 | 1.00 / token | `Tensor([[tok]])` input + `pending_copyin` doesn't drain (no `.item()` in prefill loop) |
+| Decode (50 tokens) | 1 | **0.02 / token** | only the very first decode call allocates; subsequent 49 hit the LRU cache |
+
+Mechanism for the decode "miss-then-hit" pattern: `CUDAAllocator` extends `LRUAllocator`, which keys its cache by `(size, BufferSpec)`. `BufferSpec(host=True)` is a frozen dataclass with `eq=True`, so two freshly-constructed `BufferSpec(host=True)` instances hash and compare equal. After the first decode call, `Tensor.item()` triggers `synchronize_system → synchronize`, which frees `pending_copyin` host buffers via `LRUAllocator.free` — these go into `cache[(4, BufferSpec(host=True))]`. Every subsequent decode call's `_copyin` for the new input tensor hits the cache (`c.pop()` at `tinygrad/device.py:244`). 
+
+**Iter 9's misattribution.** Iter 9's nsys trace recorded 183 `cuMemHostAlloc` calls across 174 fwd passes (74 prefill + 100 decode, 2 runs). The "≈1 alloc/decode-token" framing was wrong; the actual decomposition is ~109 (model load setup observed in trace) + 72 (prefill, 2 runs × 36 tokens) + 2 (decode stragglers, one per run as `pending_copyin` from prefill drains). Decode-time host cost from this path is ~0.02 × 263 us (median) = **~5 us / decode token** — negligible.
+
+**Iter 10c diagnosis: where the unaccounted ~1.9 ms / decode token actually goes.**
+
+Recomputed decode host budget after removing cuMemHostAlloc from the per-token equation:
+
+| Source | Per decode token | Notes |
+|---|---|---|
+| 5.5 cuGraphLaunch × 79 us | ~434 us | from iter 9, single largest identified contributor |
+| 165 cuGraphExecKernelNodeSetParams × 1.1 us | ~182 us | param-poke for buffer pointers |
+| 1 cuMemcpyDtoH (the `.item()`) | ~31 us | result extraction |
+| cuMemHostAlloc | ~5 us | LRU-cache-warmed |
+| **Identified subtotal** | **~652 us** | |
+| Decode host overhead (wall − GPU kernel sum) | **~2540 us** | from iter 9 wall-clock decomposition |
+| **Unaccounted** | **~1880 us** | the iter 10c hunt target |
+
+**cProfile on a 50-token steady-state decode loop** (`prework/cuda-parity/profile_decode_host.py`, 5 burn-in tokens excluded; cProfile inflates wall to 13.5 ms p50 / token vs raw 8.04 ms):
+
+| Function | Calls / 50 tokens | Calls / token | Cumtime (s) | Notes |
+|---|---|---|---|---|
+| `tinygrad.uop.ops.topovisit` (`uop/ops.py:203`) | 8400 | **168** | 0.331 | called from `_apply_map_to_tensors` for every live tensor |
+| `tinygrad.tensor._apply_map_to_tensors` (`tensor.py:23`) | 50 | 1.00 | 0.339 | walks `all_tensors` weakref dict every call |
+| `tinygrad.tensor.linear_with_vars` (`tensor.py:229`) | 50 | 1.00 | 0.378 | calls `_apply_map_to_tensors(name="buffers")` |
+| `tinygrad.engine.jit._prepare_jit_inputs` (`jit.py:215`) | 50 | 1.00 | 0.397 | calls `Tensor.realize(*unrealized_tensors)` for the input tensor; the realize path goes through `linear_with_vars → _apply_map_to_tensors` |
+| `runtime.support.c.wrapper` (CUDA driver call check) | 5350 | 107 | 0.243 | 5.5 cuGraphLaunches + ~165 setParams (matches iter 9 driver-API counts) |
+| `monkeypatch._cuda_graph_call_fast` | 200 | 4.0 | 0.023 | the JIT-replay graph-call path |
+
+**The dominant per-decode-token Python cost is `_apply_map_to_tensors`.** It iterates the global `all_tensors: dict[weakref.ref[Tensor], None]` (every live model weight, every cache_kv slot, every intermediate Tensor still in scope) and calls `t.uop.topovisit(visitor, in_scope)` on each. With Llama 3.2 1B loaded, that's ~150+ tensors per call. Subtracting cProfile's ~3x Python-instrumentation inflation, the raw cost is in the **1.5-2 ms / decode token** range — which fits the ~1.88 ms unaccounted residue.
+
+The mechanism: `_prepare_jit_inputs` calls `Tensor.realize(*unrealized_tensors)` (`jit.py:222`) for the freshly-constructed `Tensor([[last_tok]])` input. `realize` calls `linear_with_vars`, which calls `_apply_map_to_tensors(becomes_map, name="buffers")` (`tensor.py:232`). This walk is correct in the general case — after realization, any user-held Tensor whose `uop` referenced a now-realized intermediate needs its `.uop` field updated to the new buffer-backed UOp — but it is wasteful in the JIT-replay steady-state, where the only "new" tensor is a single 4-byte input that has no user-held references in `all_tensors` to update.
+
+**Frontier #4 reframed.** Iter 7's frontier #4 (`_prepare_jit_inputs` ~50 LOC) was sized at 11.5 us cumtime per call. The cProfile shows it's actually 7.94 ms cumtime per call (cProfile-inflated). Most of that is the `_apply_map_to_tensors` traversal, not `_prepare_jit_inputs` proper. The fix LOC budget needs revision: a JIT-replay-aware fast path in `_apply_map_to_tensors` that bypasses the `all_tensors` walk when the `applied_map` only touches "leaf" UOps with no user-held tensor references is the natural shape, but is risky to gate without breaking general realize semantics.
+
+**Reasoning mode (iter 10).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| Pure decode allocates ~0.02 cuMemHostAlloc per token (LRU cache works) | induction | 99% | direct count over 50 decode tokens, single instrumented run |
+| iter 9's "1 alloc/decode-token" was a phase-conflation artifact | deduction | 95% | per-phase counts plus a closed-form match: 109 (load) + 72 (2×36 prefill) + 2 (decode) ≈ 183 |
+| `cuMemHostAlloc` contributes ~5 us / decode token | deduction | 95% | 0.02/token × 263 us median |
+| `_apply_map_to_tensors` is called once per decode token via `_prepare_jit_inputs → realize → linear_with_vars` | deduction | 99% | direct read of `tensor.py:222,229,232` plus cProfile call counts (50/50 tokens) |
+| `topovisit` is called ~168 times per decode token | observation | 95% | cProfile: 8400 / 50; matches "150+ live tensors per `_apply_map_to_tensors` walk" estimate |
+| Raw (non-cProfile) `_apply_map_to_tensors` cost is ~1.5-2 ms / decode token | abduction | 70% | cProfile cumtime 0.339 s / 50 = 6.78 ms inflated; 3x Python-overhead deflation → ~2 ms; matches unaccounted residue but the deflation factor is approximate |
+| The fix is a JIT-replay-aware fast path in `_apply_map_to_tensors` | hypothesis | 50% | mechanism is plausible (input tensors are leaves with no user-held references) but breaking general realize semantics is a real risk — would need a careful gate condition |
+
+**Strategic update.** Iter 9 framed v1.0 shape (b1) as "ship as: beats torch+HF; loses to llama.cpp 1.80x with documented per-kernel breakdown." Iter 10 doesn't change the headline number but does correct the **mechanism** half of the breakdown: of the 65% wall-gap attributed to host overhead, ~75% (1.88 / 2.54 ms / token) is now localized to a single tinygrad-framework call site, not split across cuMemHostAlloc + cuGraphLaunch + Python traffic-cop. The fix scope is unknown until the gate condition for a JIT-replay fast path is designed and adversarial-reviewed, but the LOC bound is small (the function being optimized is 16 lines).
+
+**Reproduce.**
+
+```powershell
+$env:PYTHONPATH = "."
+.venv\Scripts\python prework\cuda-parity\probe_hostalloc.py 2> probe.log
+.venv\Scripts\python prework\cuda-parity\profile_decode_host.py > decode_profile.txt 2>&1
+```
+
+**Open frontier item filed: iter 10c.** `_apply_map_to_tensors` JIT-replay fast path. LOC: unknown (gate-condition design required). Impact: ~1.5-2 ms / decode token if it cleanly bypasses the all_tensors walk — would put speedygrad fp16 1B decode at ~6 ms / token = ~1.35x of llama.cpp. Risk: high — bypassing the walk in the wrong condition would break tensor identity for user-held references after realize. Adversarial review (gemini, codex/bug-hunt) before any patch.
+
+**Implementation surface.** The fix lands in `monkeypatch.py` as a rebind of `tinygrad.tensor._apply_map_to_tensors`, in the same pattern as the existing `run_linear` and `CUDAGraph.__call__` rebinds. Editing `tinygrad/tensor.py` directly is not the path: the upstream-tinygrad function is general-purpose and correct for non-JIT use; the speedygrad-specific fast path conditionally short-circuits when the JIT replay invariants hold (e.g., `applied_map` keys are all freshly-realized BUFFER UOps with no other user-held tensor references). For hot loops, monkeypatching is the only viable approach — direct tinygrad edits force re-merging on every upstream sync and lose the clear speedygrad-specific marker.
+
+---
+
 **Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |
