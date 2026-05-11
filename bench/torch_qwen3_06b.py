@@ -21,16 +21,18 @@ import argparse, time, json, os, sys
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL_ID = "Qwen/Qwen3-0.6B"
+DEFAULT_MODEL_ID = "Qwen/Qwen3-0.6B"
 PROMPT = "Hello."
 N_NEW_TOKENS = 25
 
 def main():
   ap = argparse.ArgumentParser()
+  ap.add_argument("--model", type=str, default=DEFAULT_MODEL_ID, help="HuggingFace model ID")
   ap.add_argument("--runs", type=int, default=5, help="full prefill+decode runs")
   ap.add_argument("--n-new", type=int, default=N_NEW_TOKENS)
   ap.add_argument("--out", type=str, default=None)
   args = ap.parse_args()
+  MODEL_ID = args.model
 
   assert torch.cuda.is_available(), "CUDA required"
   dev = "cuda"

@@ -1,11 +1,20 @@
-"""Import and apply Cython-compiled rewrites and runtime fast path."""
-import os
-# default-on single-kernel graph capture: cuGraphLaunch beats cuCtxSetCurrent+cuLaunchKernel
-# by ~17us on Windows. Set before tinygrad imports — getenv() is functools.cached.
-os.environ.setdefault("GRAPH_ONE_KERNEL", "1")
+"""Import and apply Cython-compiled rewrites and runtime fast path.
+
+Set SPEEDYGRAD_VANILLA=1 to make this entire module a no-op (vanilla tinygrad
+behavior). Used for A/B benchmarking speedygrad vs vanilla tinygrad.
+"""
+import os, sys
+_VANILLA = bool(os.environ.get("SPEEDYGRAD_VANILLA"))
+if _VANILLA:
+    print("[monkeypatch] SPEEDYGRAD_VANILLA=1 — running vanilla tinygrad", file=sys.stderr)
+else:
+    # default-on single-kernel graph capture: cuGraphLaunch beats cuCtxSetCurrent+cuLaunchKernel
+    # by ~17us on Windows. Set before tinygrad imports — getenv() is functools.cached.
+    os.environ.setdefault("GRAPH_ONE_KERNEL", "1")
 
 from tinygrad.uop.ops import RewriteContext, PatternMatcher, UOp
 try:
+    if _VANILLA: raise ImportError("vanilla mode")
     from cy_rewrite import cy_unified_rewrite, cy_rewrite, cy_toposort, cy_dfs_match
     RewriteContext.unified_rewrite = cy_unified_rewrite
     PatternMatcher.rewrite = cy_rewrite
@@ -17,6 +26,7 @@ except ImportError:
 # Runtime fast path: rebind run_linear at every import site so call sites that did
 # `from tinygrad.engine.realize import run_linear` pick up the Cython version.
 try:
+    if _VANILLA: raise ImportError("vanilla mode")
     from cy_runtime import cy_run_linear
     import tinygrad.engine.realize as _realize_mod
     import tinygrad.engine.jit as _jit_mod
@@ -31,6 +41,7 @@ except ImportError:
 # Saves 2 Python frames (lambda + cu_time_execution) per kernel call on the JIT-replay
 # hot path. Same observable behavior; cu_time_execution(cb, enable=False) just calls cb().
 try:
+    if _VANILLA: raise ImportError("vanilla mode")
     import ctypes as _ct
     import tinygrad.runtime.autogen.cuda as _cuda
     from tinygrad.runtime.ops_cuda import check as _check, cu_time_execution as _cu_time
@@ -77,6 +88,7 @@ except ImportError:
 # Per-call: convert applied_map.keys() to {id(k) for k in applied_keys},
 # then `applied_id_set.isdisjoint(cached_id_set)` is the gate.
 try:
+    if _VANILLA: raise ImportError("vanilla mode")
     if os.environ.get("MEMOIZE_WALK_DISABLE"): raise ImportError("MEMOIZE_WALK_DISABLE set")
     import weakref as _weakref_mw
     import tinygrad.tensor as _tensor_mod_mw

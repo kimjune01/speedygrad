@@ -53,8 +53,12 @@ def main():
   # iter 10c-cont v2 trick: collapse the global RNG counter chain that may
   # have accumulated during weight processing or model build. Cheap no-op
   # if the dict is empty (no rand op has triggered _next_counter yet).
-  for _counter in Tensor._device_rng_counters.values():
-    _counter.realize()
+  # Skipped under SPEEDYGRAD_VANILLA=1 so the vanilla measurement reflects
+  # what users get from upstream tinygrad without any speedygrad-discovered
+  # bench-side tricks.
+  if not os.environ.get("SPEEDYGRAD_VANILLA"):
+    for _counter in Tensor._device_rng_counters.values():
+      _counter.realize()
 
   model_name = kv.get('general.name') or kv.get('general.basename') or args.model
   n_params = sum(x.numel() for x in __import__('tinygrad').nn.state.get_parameters(model))

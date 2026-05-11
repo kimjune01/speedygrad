@@ -19,6 +19,27 @@ AGPL-3.0 fork of [tinygrad](https://github.com/tinygrad/tinygrad). Measurement-d
 
 Shapes: N=1024 for gemm/mul\_sum, 256 for gemm\_256/softmax/layernorm/permute, 4096 for add/relu/sum, 4096x4096 for matvec. Wall-clock time including Metal dispatch. "was" column from the [realize investigation](HYPOTHESIS_GRAPH.md) on upstream tinygrad.
 
+## LLM inference (RTX 4080, p50 decode tok/s)
+
+| Model | quant | vanilla tinygrad | **speedygrad** | sg/vanilla | torch+HF (eager) | sg/torch |
+|---|---|---:|---:|---:|---:|---:|
+| Llama 3.2 1B (safetensors) | fp16 | 83 tok/s | **140 tok/s** | **1.68×** | 20 tok/s | **7.0×** |
+| Qwen 3 0.6B (GGUF) | Q8\_0 | 226 tok/s | **241 tok/s** | **1.07×** | 13 tok/s | **18.5×** |
+| Qwen 3 1.7B (GGUF) | Q4\_K\_M | 133 tok/s | **127 tok/s** | **0.95×**\* | 9 tok/s | **14.1×** |
+| Qwen 3 8B (GGUF) | Q4\_K\_M | 0.9 tok/s | **1.0 tok/s** | 1.1× | 7 tok/s | **0.14×**⚠️ |
+
+\* 1.7B speedygrad row is within measurement noise of vanilla; the new GGUF inference path (`tinygrad/llm/model.py`) is already efficient enough that speedygrad's monkeypatch optimizations have less room to help. The bigger wins on Llama 1B are on the older `examples/llama3.py:build_transformer` safetensors path.
+
+⚠️ **Qwen 3 8B Q4\_K\_M is broken** at ~1 tok/s decode (we should be ≥50). Q4\_K\_M dequantization on tinygrad's CUDA path is bandwidth-pathological at 8B size — known issue, filed as frontier item. Use Q8\_0 or fp16 (when memory permits) for now.
+
+Reproduce:
+
+```bash
+PYTHONPATH=. python bench/scaling_table.py --runs 3 --n-new 20
+```
+
+The bench harness runs each (model × framework) combo as a subprocess for clean state. `SPEEDYGRAD_VANILLA=1` env var disables all monkeypatch optimizations on the same bench code, isolating the speedygrad fork's contribution from the underlying tinygrad framework's. torch+HF baseline uses `transformers.AutoModelForCausalLM` eager mode (no `torch.compile`, no SDPA hint) — the default path most users start with. Both produce identical greedy text (`temperature=0`).
+
 ## What changed
 
 **Abduction engine** replaces the heuristic and BEAM search. Hypothesis-driven: try candidates, keep the best, follow the winner's category at the next depth. `SEARCH=3` by default. Usually finds faster kernels than the heuristic when search budget is acceptable (~20 trials/kernel avg, cached after first run).

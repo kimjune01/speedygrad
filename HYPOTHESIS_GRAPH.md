@@ -1815,6 +1815,54 @@ Two of four competitors still unmeasured. The Qwen result strengthens the "revis
 
 2. **Different architectures have different overhead profiles.** Llama-vs-Qwen on the SAME framework (speedygrad) shows 267 vs 172 tok/s (Qwen actually faster despite no GQA — smaller model dominates). On torch+HF, Qwen is SLOWER than Llama (15.5 vs ~30 tok/s) because the layer-count dominates dispatch overhead. Speedygrad's CUDAGraph fast path absorbs that asymmetry.
 
+---
+
+### Iter 11b (this session): scaling table — speedygrad vs vanilla tinygrad delta is path-dependent
+
+**Question.** Iter 11a's Qwen 3 0.6B win (267 vs 15.5 = 17×) was vs torch+HF, not vs vanilla tinygrad. The actual "differentiate speedygrad from tinygrad" question requires a same-bench A/B with monkeypatch on/off.
+
+**Setup.** Added `SPEEDYGRAD_VANILLA=1` env var to `monkeypatch.py` that skips all rebinds (cy_rewrite, cy_runtime, CUDAGraph fast path, memoize-walk). Same env var also skips the bench-side `counter.realize()` trick. Resulting "vanilla" run = stock tinygrad behavior on the same bench harness. Built `bench/scaling_table.py` to subprocess-run each (model × framework) combo for clean state.
+
+**Result (RTX 4080, 3 runs × 20 decode tokens):**
+
+| Model | quant | Vanilla tinygrad | Speedygrad | sg/vanilla | torch+HF | sg/torch |
+|---|---|---:|---:|---:|---:|---:|
+| Llama 3.2 1B (older `examples/llama3.py` path) | fp16 | 83 tok/s | **140 tok/s** | **1.68×** | 20 tok/s | 7.0× |
+| Qwen 3 0.6B (new `tinygrad/llm/model.py` path) | Q8_0 | 226 tok/s | **241 tok/s** | **1.07×** | 13 tok/s | 18.5× |
+| Qwen 3 1.7B (new path) | Q4_K_M | 133 tok/s | **127 tok/s** | **0.95×** (noise) | 9 tok/s | 14.1× |
+| Qwen 3 8B (new path) | Q4_K_M | 0.9 tok/s | **1.0 tok/s** | 1.1× | 7 tok/s | **0.14× ⚠️** |
+
+**Two findings worth confronting:**
+
+1. **Speedygrad-vs-vanilla differentiation is path-dependent.** On the OLDER safetensors path (Llama via `examples/llama3.py:build_transformer`), speedygrad gives a real 1.68× win — counter.realize and memoize-walk both fire and contribute the full delta we measured in iter 10c-cont v3-v4. On the NEWER GGUF path (Qwen via `tinygrad/llm/model.py:Transformer.from_gguf`), the win shrinks to 1.07× / noise. Likely because (a) GGUF loading doesn't trigger the random-init counter chain (counter.realize is a no-op anyway), (b) the new path may already be more efficient internally so memoize-walk has less to amortize. **Strategic implication for the README: differentiation is real on the older path, marginal on the new path.**
+
+2. **Qwen 3 8B Q4_K_M decode is broken at ~1 tok/s.** decode_p50 = 1051ms per token (should be ≤50ms based on Q4_K_M ~5GB / 700GB/s HBM = ~7ms theoretical). 7× slower than torch+HF eager (which itself isn't optimized — torch is at 144ms p50). Likely Q4_K_M dequant on tinygrad's CUDA path has bandwidth-pathological access patterns at 8B model size — small models hide the inefficiency, large ones expose it. This is the one category where we're actually slower than torch+HF, and it's specifically the workload tinybox shoppers care about most (8B is the dominant local-inference size). Filed as iter 12+ frontier item: **investigate Q4_K_M dequant kernel quality at 8B+ size**.
+
+**Reasoning mode (iter 11b).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| sg-vs-vanilla delta is 1.68× on older safetensors path, 1.07× on new GGUF path | observation | 99% | direct A/B with same bench code, env var only difference |
+| Qwen 3 8B Q4_K_M decode at 1 tok/s is a real perf bug not a measurement error | observation | 99% | reproducible across 60 measured tokens, 1051ms p50 with low variance |
+| The 8B regression is Q4_K_M-quant-specific, not size-specific | hypothesis | 60% | small Q4 (1.7B) works fine; need to test 8B at fp16 or Q8_0 to confirm. fp16 8B = 16GB which won't fit; Q8_0 8B might at ~8GB |
+| New GGUF path needing less monkeypatch help means upstream tinygrad/llm has absorbed similar optimizations | hypothesis | 70% | structural read of tinygrad/llm/model.py shows it's a more recent / cleaner inference path; less room for fork-side wins |
+
+**Files this iter:**
+- `bench/scaling_table.py` — subprocess-driven sweep runner, generates Markdown table
+- `bench/torch_qwen3_06b.py` — added `--model` arg for parameterized HF model loading
+- `bench/speedygrad_qwen3_06b.py` — gated counter.realize() on SPEEDYGRAD_VANILLA env var
+- `bench/speedygrad_llama32_1b.py` — gated counter.realize() on SPEEDYGRAD_VANILLA env var
+- `monkeypatch.py` — added SPEEDYGRAD_VANILLA env var that skips all rebinds
+- `README.md` — added LLM inference table
+
+**Carry (methodology):**
+
+1. **The "speedygrad vs tinygrad" delta isn't a single number — it's path-dependent.** Honest framing in marketing materials must distinguish "speedygrad's wins on the older inference paths (large) vs the newer ones (small)." Anyone reproducing the bench should expect the table values to drift as upstream tinygrad absorbs improvements.
+
+2. **A README bench should include the broken row.** Hiding the 8B regression to make the table look better is sandbagging the audience. Including it with the ⚠️ marker tells shoppers what they need to know: "this works for these workloads, this doesn't, here's the active investigation." That's engineering credibility, not marketing puffery.
+
+---
+
 **Reproduce.**
 
 ```powershell

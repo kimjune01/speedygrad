@@ -46,8 +46,11 @@ def main():
   # accumulated during weight init (one .assign per random-init weight =
   # ~114-deep chain for 1B). Walked from scratch every _apply_map_to_tensors
   # call otherwise — 73% of decode-phase walk cost is this stale history.
-  for _counter in Tensor._device_rng_counters.values():
-    _counter.realize()
+  # Skipped under SPEEDYGRAD_VANILLA=1 so the vanilla measurement reflects
+  # what users get from upstream tinygrad without speedygrad bench-side tricks.
+  if not os.environ.get("SPEEDYGRAD_VANILLA"):
+    for _counter in Tensor._device_rng_counters.values():
+      _counter.realize()
 
   # Use HF tokenizer for input encoding so token IDs match torch bench exactly
   tokenizer = AutoTokenizer.from_pretrained(str(model_path))
