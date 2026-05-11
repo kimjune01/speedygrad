@@ -1581,6 +1581,57 @@ The memoize-walk approach from iter 10c-cont v1 is now lower-priority. Even afte
 
 ---
 
+### Iter 10c-cont v2 — applied + end-to-end verified
+
+**Stale-state scan (`prework/cuda-parity/probe_stale_state_scan.py`).** Walked all 167 live tensors after prefill+burn, sorted by UOp DAG size:
+
+```
+n_uops  op       shape         dtype  category
+  1615  AFTER    (2,)          uint   rng_counter   ← the dominant tensor
+     9  RESHAPE  (2048, 2048)  half   model_param   ← all 146 model weights, depth 9
+     9  RESHAPE  (512, 2048)   half   model_param   ← (BUFFER + RESHAPE + CAST chain)
+     ...
+```
+
+**0 'other' tensors with n_uops > 50.** The RNG counter is the ONLY stale-state Tensor in the bench. Confirmed via progressive A/B: realize-counter alone gets the full apply-cost reduction (-1627us); realize-everything-else-deep adds nothing (because there is nothing else deep).
+
+**End-to-end canonical bench (`bench/speedygrad_llama32_1b.py`, runs=5, n-new=25).** Same session, same code, with and without the one-line `Tensor._device_rng_counters['CUDA'].realize()` after `build_transformer`:
+
+| | decode_us_p50 | **decode_tps_p50** | prefill_ms_p50 |
+|---|---|---|---|
+| Baseline (no fix) | 9569 us | **104.5 tok/s** | 176.1 ms |
+| With counter.realize() | 6815 us | **146.7 tok/s** | 89.4 ms |
+| **Delta** | **−29%** | **+40%** | **−49%** |
+
+vs llama.cpp 224 tok/s: baseline **2.14× slower** → with fix **1.53× slower**. Closes ~50% of the iter 9 host gap.
+
+**Fix applied** at `bench/speedygrad_llama32_1b.py:43-48` (after `build_transformer`):
+
+```python
+# iter 10c-cont v2: collapse the global RNG counter's AFTER chain that
+# accumulated during weight init (one .assign per random-init weight =
+# ~114-deep chain for 1B). Walked from scratch every _apply_map_to_tensors
+# call otherwise — 73% of decode-phase walk cost is this stale history.
+for _counter in Tensor._device_rng_counters.values():
+  _counter.realize()
+```
+
+Scoped to the bench rather than `examples/llama3.py` `build_transformer` because (a) the bench is the canonical perf measurement target, (b) `build_transformer` is shared with infer demos that may want to keep RNG state lazy for other reasons, (c) easier to bisect if anything regresses. Promotion to `build_transformer` (or to tinygrad-side `manual_seed`) is a follow-up decision.
+
+**Surprise: the prefill win is bigger than the decode win in absolute terms.** Decode wall −2754us × 25 tokens × 5 runs = ~344ms saved; prefill wall −86.7ms × 5 runs = ~434ms saved. The prefill phase has 3.3 `_apply_map_to_tensors` calls per token (vs 1 per decode token), so the per-call walk reduction multiplies. This makes frontier #9 (batched prefill) lower-priority than the iter 10c-cont v1 reframe suggested — much of the per-prefill-token overhead it aimed at is now gone.
+
+**Updated frontier ranking (iter 10c-cont v2 close):**
+
+| # | Edge | Status after counter.realize() |
+|---|---|---|
+| 4 | `_apply_map_to_tensors` walk cost | **partially closed**: 73% of decode-phase cost eliminated. Remaining ~536us/call (8.2% of wall) is the 167 model-param walks. Memoize-walk would shave another ~400us. Lower priority |
+| 9 | Batched prefill | **lower priority**: prefill is now 89ms/36tok = 2.5ms/tok (vs iter 8's 19ms/tok baseline). Most of the gap to torch (1.16ms/tok) is now real GPU+kernel-launch overhead, not Python frame churn |
+| 2 | online-softmax integration | **highest remaining**: the 4.2x attention gap is GPU-side, untouched by host-cost fixes. Now the dominant remaining gap to llama.cpp |
+
+The headline now reads: **speedygrad fp16 1B at 147 tok/s, 1.53x slower than llama.cpp**, with the remaining gap being roughly 1/3 host overhead (memoize-walk + minor) and 2/3 GPU kernel quality (attention fusion + matvec codegen). Clean separation for future work.
+
+---
+
 **Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |

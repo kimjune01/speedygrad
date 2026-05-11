@@ -42,6 +42,13 @@ def main():
   print(f"loading {model_path} on {device}", file=sys.stderr)
   model = build_transformer(model_path, model_size="1B", quantize=None, device=device)
 
+  # iter 10c-cont v2: collapse the global RNG counter's AFTER chain that
+  # accumulated during weight init (one .assign per random-init weight =
+  # ~114-deep chain for 1B). Walked from scratch every _apply_map_to_tensors
+  # call otherwise — 73% of decode-phase walk cost is this stale history.
+  for _counter in Tensor._device_rng_counters.values():
+    _counter.realize()
+
   # Use HF tokenizer for input encoding so token IDs match torch bench exactly
   tokenizer = AutoTokenizer.from_pretrained(str(model_path))
   prompt_str = tokenizer.apply_chat_template([{"role": "user", "content": PROMPT}],
