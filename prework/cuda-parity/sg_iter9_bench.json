@@ -1,0 +1,19 @@
+{
+  "framework": "speedygrad",
+  "model_path": "C:\\Users\\junekim\\.cache\\llama32-1b-fp16",
+  "device": "CUDA",
+  "dtype": "fp16",
+  "prompt": "Hello.",
+  "prompt_len": 37,
+  "n_new_tokens": 100,
+  "runs": 3,
+  "n_decode_samples": 297,
+  "decode_us_p10": 7741.199995507486,
+  "decode_us_p50": 8032.599987927824,
+  "decode_us_p90": 8628.399998997338,
+  "decode_tps_p50": 124.492692466063,
+  "decode_tps_p10": 115.89634232490437,
+  "decode_tps_p90": 129.17893874080738,
+  "prefill_ms_p50": 152.5580000015907,
+  "generated_text_run0": "Hello. Is there something I can help you with or would you like to chat?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nI can provide information and answer questions on a wide range of topics. What's on your mind?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nI can also help with tasks such as:\n\n- Writing and proofreading\n- Summarizing long pieces of text\n- Providing definitions and explanations\n- Offering suggestions and ideas\n- And more\n\nWhat specific task or topic would you like help with?<|eot_id|><|start_header_id|>"
+}

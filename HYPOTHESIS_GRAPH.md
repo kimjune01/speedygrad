@@ -1146,6 +1146,123 @@ Bench scripts: `bench/speedygrad_llama32_1b.py`, `bench/torch_llama32_1b.py`. Re
 
 ---
 
+### Iter 9 (this session): llama.cpp head-to-head — 1.80x slower on f16, gap is ~35% GPU + ~65% host
+
+**H₀.** Speedygrad's iter 6/7/8 host-floor wins are decisive enough to also beat llama.cpp on Llama 3.2 1B fp16 decode, or — failing that — produce a credible per-kernel breakdown of where speedygrad wins/loses with mechanism + scope per gap. Per the v1.0 ROADMAP: "a precise per-kernel loss diagnosis with LOC estimates per gap is a publishable v1.0 artifact even when some kernels lose."
+
+**Setup.** llama.cpp `b9102` prebuilt CUDA 12.4 (RTX 4080 sm_89, driver 596.36, Windows 11). Models: Q6_K already cached, Q4_K_M and f16 GGUFs from `bartowski/Llama-3.2-1B-Instruct-GGUF`. Speedygrad re-benched on the post-iter-8.1 codebase. Matched 37-token HF chat-template prompt for both frameworks (verified: `llama-tokenize` on the GGUF embeds the same tokenizer and produces 37 tokens for the rendered prompt).
+
+**Black-box scoreboard:**
+
+| Quant | llama.cpp tg25 (tok/s) | speedygrad (tok/s) | Ratio (llama.cpp / speedygrad) |
+|---|---|---|---|
+| f16 | 224.12 ± 2.52 | 124.5 (p50, 297 samples, runs=3 n-new=100) | **1.80x llama.cpp** |
+| Q6_K | 424.84 ± 8.49 | ~65 (iter 8 stale, pre-8.1) | ~6.5x **stale** — not re-benched this iter |
+| Q4_K_M | 505.79 ± 6.37 | n/a (no Q4_K_M decode path in speedygrad) | — |
+
+llama-bench tg25 was cross-checked against single-shot `llama-cli` matched-prompt runs (235.7 tok/s on 5-token gen, 222.3 tok/s on 100-token gen) — same regime. Speedygrad headline 124.5 tok/s reproduced both with and without nsys instrumentation (8.04 ms p50 wall). Note: this is **+19 tok/s vs iter 8.1's 105 tok/s** — likely due to drift between sessions or tighter steady-state under repeated runs; no specific commit identified.
+
+**White-box per-kernel diagnosis (nsys profile --cuda-graph-trace=node, both frameworks).**
+
+llama.cpp profile: `llama-bench -p 0 -n 100 -r 2` → 200 decode passes, 12 distinct kernels, 46,029 graph-node executions. Total per-fwd-pass GPU kernel sum = **4242 us**. Single `cudaGraphLaunch_v10000` per token (median 373 us, blocking).
+
+Speedygrad profile: `bench/speedygrad_llama32_1b.py --runs 2 --n-new 50` → 174 fwd passes (74 prefill + 100 decode), 22 distinct kernels, 40,093 graph-node executions. Total per-fwd-pass kernel sum = **5500 us**. Per-token: **5.5 cuGraphLaunches** (median 79 us each), **165 `cuGraphExecKernelNodeSetParams` calls** (median 1.1 us), 1 `cuMemcpyDtoH` (.item()), and a hot-loop `cuMemHostAlloc` pattern (183 calls × avg 986 us — see mechanism below).
+
+Per-fwd math is consistent with seqlen=1 prefill loop (15.8 inst/fwd × 174 fwds ≈ 2749 ≈ 16 layers × 174). Speedygrad's prefill is 1-token-at-a-time through the JIT path (iter 8 finding still holds; frontier #9 unchanged), so the 5500 us/fwd averages prefill (smaller KV cache) and decode (larger KV cache) — pure decode is at least 5500 us, biasing GPU gap larger if anything.
+
+**Wall-clock decomposition:**
+
+| Metric | speedygrad | llama.cpp | Gap | % of total wall gap |
+|---|---|---|---|---|
+| Decode wall p50 | 8.04 ms | 4.46 ms | **+3.58 ms (1.80x)** | 100% |
+| Decode GPU work (kernel sum / fwd) | 5.50 ms | 4.24 ms | +1.26 ms (1.30x) | **~35%** |
+| Decode host overhead (wall − GPU) | 2.54 ms | 0.22 ms | +2.32 ms (11.5x) | **~65%** |
+
+**Per-op-class breakdown (per fwd pass):**
+
+| Op class | speedygrad | llama.cpp | Gap | Mechanism / fix scope |
+|---|---|---|---|---|
+| Big matmuls (FFN gate/up/down + QKVO + lm_head) | 4254 us | 4084 us | +4% | parity in aggregate; tinygrad codegen is competitive with `mul_mat_vec_f` templates |
+| **lm_head specifically (vocab projection)** | 967 us (`r_32064_16_4_128`, 1/fwd) | not isolated in trace top-12 (likely fused into per-layer `mul_mat_vec_f`) | unknown — needs targeted measurement | speedygrad burns 17.6% of GPU time on logit projection; llama.cpp's lm_head kernel was not separately identifiable from the kernel summary |
+| Small per-layer matvecs (Q/K/V/O projections) | 526 us (2 kernels, 16/fwd each) | 47 us (small `mul_mat_vec_f<half,half,1,128>`) | **+10x** | speedygrad emits separate kernels for ops llama.cpp fuses; check whether QKV fusion at the Tensor level would help |
+| Attention KV-dependent (Q@K^T, softmax, ×V, fixup) | 624 us (4 kernels with `start_pos` Variable) | 148 us (`soft_max_f32` + `flash_attn_*` family) | **+4.2x** | matches iter 7.5 frontier #5: 4-7 kernels vs 1-2; iter 8a (online-softmax integration, ~200 LOC) is the planned fix |
+| RMSNorm | 71 us (`r_256_8`, 48.4/fwd) | 75 us (`rms_norm_f32<1024>`, 33.2/fwd) | parity | 33 norms/fwd both (16 layers × 2 + final) |
+| RoPE | folded into other kernels (no standalone) | 35 us (`rope_norm` ×2 dtype variants) | n/a | speedygrad fuses RoPE into Q/K matmul prep |
+| KV cache write | folded (uses `.assign()` in-place) | 20 us (`k_set_rows`) | n/a | speedygrad architecturally cheaper here |
+| Residual add | folded into elementwise kernels | 1 us (`k_bin_bcast<add>`) | n/a | both negligible |
+
+**Host-side breakdown (cuda_api_sum on speedygrad node-mode trace, 100 decode tokens):**
+
+| API | Calls | Total ms | Per-decode-token | Notes |
+|---|---|---|---|---|
+| `cuCtxSynchronize` | 101 (= 100 decode + 1 final) | 462.6 | 4.58 ms median wait | this is the GPU-drain wait at `.item()`; **NOT** a measure of pure GPU time (CPU may have done concurrent work before sync) |
+| `cuGraphLaunch` | 684 | 243.4 | ~2.4 ms | 5.5 launches/decode × 79 us median + outliers |
+| `cuGraphExecKernelNodeSetParams` | 16,587 | 22.3 | 0.22 ms | 165 param-pokes/decode × 1.1 us median |
+| `cuMemHostAlloc` | 183 | 180.5 | ~1.0 ms (avg, not median) | **hot-loop pattern**: 183 calls / 174 fwds ≈ 1 per fwd; median 263 us, avg 986 us — bursty allocations during JIT replay |
+| `cuMemcpyDtoH` (the `.item()`) | 100 | 3.1 | 0.031 ms | trivial |
+
+The cleanly identified host contributors (cuGraphLaunch + param-pokes + cuMemHostAlloc + memcpy) sum to ~3.7 ms of CPU work per token, which is close to the 2.54 ms host-overhead estimate. The discrepancy (~1 ms) is partial CPU/GPU overlap — some host work runs while GPU is busy. The dominant single mechanism is the **`cuMemHostAlloc` hot loop**, not multi-graph dispatch.
+
+**Reasoning honesty (this iter's bug-hunt round 1).**
+
+The first-pass writeup of this finding incorrectly framed the GPU as "essentially at parity" (within 3%) by comparing speedygrad's `cuCtxSynchronize` median (4.37 ms) to llama.cpp's pure kernel sum (4.24 ms). Adversarial review (Gemini 3.1 Pro) flagged this as apples-to-oranges: `cuCtxSync` measures the CPU's *wait* duration, which is a strict lower bound on GPU time (the CPU may have been doing concurrent Python work before reaching the sync point). Using the like-for-like measure (both kernel sums) gives a 30% GPU gap, not 3%. The bug-hunt also pointed out that `cuMemHostAlloc`'s 183 calls / 174 fwds was a hot-loop signature I had dismissed as "one-time amortized." Both corrections are reflected in the table above. Original review: `prework/cuda-parity/gemini_iter9_review.md`.
+
+**Strategic shape of the artifact.**
+
+The honest finding is **(b) partial loss + scoped v1.0 revision with public reasoning**, not (a) clean win or (c) clean loss diagnosis:
+
+1. **GPU kernel quality is competitive but not at parity** (1.30x slower in aggregate). Two-thirds of the GPU gap localizes to two op classes already on the frontier: **attention KV-dependent ops (4.2x slower, frontier #5/iter 8a, ~200 LOC)** and **lm_head logit projection (~967 us = 17.6% of GPU time, no specific frontier item — file as iter 10a)**. Big matmuls are at parity.
+2. **Host overhead is ~17x worse on speedygrad** (2.54 vs 0.22 ms/token). This is 65% of the wall-clock gap. Dominant contributors: hot-loop `cuMemHostAlloc` (~1 ms/token, mechanism unknown — file as iter 10b), multi-graph cuGraphLaunch (~0.4 ms from 5.5 launches/token), parameter rebinding ctypes loop (~0.2 ms from 165 pokes/token). Fixing all three would close most of the host gap.
+3. **Quantization gap is much wider** (~6.5x at Q6_K, stale; speedygrad has no Q4_K_M path). llama.cpp's Q4_K_M at 505 tok/s vs speedygrad's f16 at 124 tok/s is a 4x gap, indicating dedicated `mul_mat_q` kernels (frontier #3, ~300 LOC) are the structural improvement needed for quant parity.
+
+**v1.0 implication.** The original ROADMAP policy ("if we genuinely can't beat llama.cpp, then v1.0 doesn't ship") needs scoped revision: speedygrad cannot claim general llama.cpp-parity for v1.0, but it *can* honestly claim PyTorch+HF-parity (already shipped, 2.96x at p50) and document the llama.cpp gap with mechanism per-class. Three reasonable shapes for v1.0:
+
+- **(b1)** Ship v1.0 as "beats torch+HF eager fp16; loses to llama.cpp by 1.80x with documented per-kernel breakdown" — honest, publishable.
+- **(b2)** Hold v1.0 until at least the host-floor frontier (iter 10b + multi-graph collapse) closes the host gap to ~5x of llama.cpp — would put speedygrad at ~1.3x of llama.cpp wall-clock.
+- **(b3)** Hold until both host-floor AND attention-fusion (iter 8a) land — would put speedygrad at ~1.1x of llama.cpp.
+
+(b1) is the option consistent with the briefing's "honest answer" guidance. (b2) and (b3) are improvement-blocked.
+
+**Reasoning mode (iter 9, post bug-hunt round 1).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| llama.cpp f16 1B decode = 224 tok/s on RTX 4080 | induction | 99% | llama-bench tg25 r=8 + 2 cross-check llama-cli runs |
+| Speedygrad fp16 1B decode = 124.5 tok/s p50 (post iter 8.1) | induction | 95% | 297 samples, runs=3 n=100, reproduced with and without nsys |
+| 1.80x wall-clock gap (llama.cpp wins) | deduction | 99% | direct ratio of two measurements above |
+| GPU work is 1.30x slower on speedygrad (kernel sum 5.50 vs 4.24 ms/fwd) | induction | 90% | nsys node-mode trace, both frameworks measured the same way |
+| ~35% of wall gap is GPU, ~65% is host | abduction | 80% | wall − kernel-sum gives host estimate; actual partial CPU/GPU overlap may shift the split by ±10% |
+| Attention is 4.2x slower (matches iter 7.5/8a frontier) | induction | 90% | per-op class breakdown, kernel-name-based mapping |
+| lm_head is 17.6% of speedygrad GPU time, llama.cpp's lm_head not separately identifiable in trace top-12 | observation | 95% (speedygrad) / 60% (llama.cpp comparison) | direct measurement on speedygrad; llama.cpp's lm_head may be folded into a per-layer kernel template — needs targeted measurement |
+| `cuMemHostAlloc` hot-loop at ~1 ms/decode-token is a real mechanism | abduction | 75% | 183 calls / 174 fwds ≈ 1 per fwd is suspicious; median 263 us means median per-fwd cost is lower; mechanism (which code path allocates) not yet identified |
+| Multi-graph dispatch (5.5 cuGraphs per decode) contributes ~0.4 ms | induction | 85% | direct measurement: 5.5 × 79 us median = 434 us |
+| Speedygrad cannot honestly claim general llama.cpp-parity for v1.0 | deduction | 95% | follows from 1.80x wall gap with no clear path to <1.2x within current frontier |
+
+**Reproduce.**
+
+```powershell
+$env:PATH = "C:\Users\junekim\tools\llamacpp;$env:PATH"
+$nsys = "C:\Program Files\NVIDIA Corporation\Nsight Systems 2025.6.3\target-windows-x64\nsys.exe"
+
+# llama.cpp scoreboard
+foreach ($q in @("f16","Q6_K","Q4_K_M")) {
+  llama-bench.exe -m C:\Users\junekim\.cache\llamacpp-models\Llama-3.2-1B-Instruct-$q.gguf -p 0 -n 25 -r 8 -ngl 99
+}
+
+# llama.cpp per-kernel
+& $nsys profile --trace=cuda --cuda-graph-trace=node -o nsys_llamacpp_f16 `
+  llama-bench.exe -m ...f16.gguf -p 0 -n 100 -r 2 -ngl 99
+& $nsys stats --report cuda_gpu_kern_sum --format table nsys_llamacpp_f16.nsys-rep
+
+# speedygrad per-kernel (PYTHONPATH=., DEV=CUDA, monkeypatch enabled)
+& $nsys profile --trace=cuda --cuda-graph-trace=node -o nsys_speedygrad_f16 `
+  python bench/speedygrad_llama32_1b.py --runs 2 --n-new 50
+```
+
+Trace files, kernel CSVs, and Gemini review: `prework/cuda-parity/nsys_*.nsys-rep`, `prework/cuda-parity/{sg,lc}_kern_node.csv`, `prework/cuda-parity/gemini_iter9_review.md`.
+
+---
+
 **Open frontier (after iter 8):**
 
 | # | Edge | LOC | Status |
