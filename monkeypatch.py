@@ -61,7 +61,8 @@ try:
 except ImportError:
     pass
 
-# iter 10c-cont v3: memoize-walk for _apply_map_to_tensors.
+# iter 10c-cont v3-v4: memoize-walk for _apply_map_to_tensors.
+# Set MEMOIZE_WALK_DISABLE=1 to skip and use the original walk (for A/B testing).
 # Replace the per-tensor `topovisit` walk with a cached UOp-DAG-id-set lookup.
 # UOps are hashconsed (via UOpMetaClass.ucache weak refs) so when no Tensor
 # references a UOp, its __del__ fires and frees memory.
@@ -76,6 +77,7 @@ except ImportError:
 # Per-call: convert applied_map.keys() to {id(k) for k in applied_keys},
 # then `applied_id_set.isdisjoint(cached_id_set)` is the gate.
 try:
+    if os.environ.get("MEMOIZE_WALK_DISABLE"): raise ImportError("MEMOIZE_WALK_DISABLE set")
     import weakref as _weakref_mw
     import tinygrad.tensor as _tensor_mod_mw
     from tinygrad.uop.ops import UOp as _UOp_mw, TracingKey as _TracingKey_mw
