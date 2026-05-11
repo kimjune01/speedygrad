@@ -110,18 +110,21 @@ policy is allowed to be revised — but only with public reasoning, not silently
 
 ## Iterations
 
-### Iter 8 — Llama 3.2 1B inference demo — DECODE VALIDATED (2.82x), prefill open
+### Iter 8 + 8.1 — Llama 3.2 1B inference demo — DECODE WIN 2.96x, prefill 4.4x gap (was 16.4x)
 
 **Decode result.** Llama 3.2 1B-Instruct fp16 on RTX 4080:
 
 | | Speedygrad | Torch+HF eager | Ratio |
 |---|---|---|---|
-| Decode p50 | 99.8 tok/s | 35.4 tok/s | **2.82x** |
+| Decode p50 | 104.9 tok/s | 35.4 tok/s | **2.96x** |
+| Prefill p50 (37 tok) | 188 ms | 43 ms | **0.23x** (torch wins 4.4x) |
 
-Both frameworks fed identical 37-token HF chat-template input IDs, generate bit-identical 25-token output. Full writeup: HYPOTHESIS_GRAPH.md "Iter 8" section. Bench scripts: `bench/speedygrad_llama32_1b.py`, `bench/torch_llama32_1b.py`.
+Both frameworks fed identical 37-token HF chat-template input IDs, generate bit-identical 25-token output. Full writeup: HYPOTHESIS_GRAPH.md "Iter 8" + "Iter 8.1" sections. Bench scripts: `bench/speedygrad_llama32_1b.py`, `bench/torch_llama32_1b.py`.
+
+iter 8.1 closed the prefill gap from 16.4x to 4.4x by JIT-ing the start_pos=0 path (`extra/models/llama.py:223` had a TODO that excluded it). Decode variance also collapsed from 1.87x p10-p90 spread to 1.05x — every decode token now ~9.5ms ± 0.2ms.
 
 **Open before v1.0:**
-- **Prefill is 16x slower** (`examples/llama3.py:257` does one-token-at-a-time prefill). For 2048-tok prompts this dominates wall time. Filed as frontier item #9 (~30-100 LOC). Required before claiming v1.0 against any long-context workload.
+- **Prefill remaining 4.4x gap** is per-token forward latency, not host overhead — closing it needs batched seqlen>1 forward through JIT (frontier item #9, but smaller than originally scoped). Required before claiming v1.0 against long-context workloads where prefill dominates wall time.
 - **bf16 not supported in PTXRenderer** (frontier #10). Workaround: pre-convert weights on disk via `prework/cuda-parity/convert_bf16_to_fp16.py`. Recurring blocker for iter 9 architecture coverage (Mistral, Qwen also bf16).
 - Single-script repro (`python infer_llama.py "Once upon a time"`) — not yet packaged. Bench scripts work but the demo-grade script is missing.
 - Sampling utilities (top-k, top-p, temperature) — already in `examples/llama3.py:144`, not separately verified.

@@ -1039,7 +1039,44 @@ iter 8 Llama 3.2 demo because the demo's attention softmax compounds with this w
 | Wall projects to ~25us (narrows but doesn't close gap to torch ~21us) | abduction | 65% | host saves modeled per-node (not constant), not measured end-to-end |
 | Integration is 200-400 LOC, 1-2 days | abduction | 65% | scope analysis vs encdec/triton_nv_matmul reference patterns |
 
-### Iter 8 (this session): Llama 3.2 1B inference demo — VALIDATED at 2.82x decode
+### Iter 8.1 (this session, post iter 8): JIT the start_pos=0 path — prefill 3.75x, decode variance collapses
+
+**H₀.** `extra/models/llama.py:223` excluded `start_pos=0` from the JIT path with a `TODO` comment, forcing the first prefill call through a non-JIT forward (~500ms Python-overhead-dominated). Removing the exclusion means *every* single-token call during prefill hits the JIT'd cuGraph cadence.
+
+**Two underlying defects fixed.**
+1. `extra/models/llama.py:225` bound `Variable("start_pos", 1, max-1)` — domain didn't include 0. Extended to `[0, max-1]` so the JIT'd kernel handles start_pos=0 identically to subsequent positions. The KV-cache code path is uniform across start_pos values; the exclusion was prudence, not necessity.
+2. PTX renderer's `render_val` (`tinygrad/renderer/ptx.py:11`) crashed on fp16 inf and on finite values outside fp16 range. Python's `struct.pack("e", x)` raises `OverflowError` for inf, NaN, or `|x| > 65504`. The mask construction in `extra/models/llama.py:213` casts a `Tensor.full(-inf, dtype=fp16)` constant which became a `ConstFloat(-1e+38)` UOp arg in the rendered graph. Fixed by emitting IEEE 754 fp16 literals directly for inf/NaN and clamping finite overflow to fp16 ±max. Pattern matches what `llvmir.py:21` already does for double.
+
+**Result (matched 37-token HF prompt, fp16, 5×25 tokens, 120 decode samples):**
+
+| Metric | iter 8 (start_pos=0 non-JIT) | iter 8.1 (start_pos=0 JIT'd) | Change |
+|---|---|---|---|
+| Prefill p50 (37 tok) | 705 ms | **188 ms** | **3.75x faster** |
+| Decode p50 | 10.02 ms (99.8 tok/s) | **9.53 ms (104.9 tok/s)** | +5% |
+| Decode p10 | 7.88 ms (126.8 tok/s) | 9.40 ms (101.7 tok/s) | -20% |
+| Decode p90 | 14.75 ms (67.8 tok/s) | **9.84 ms (106.3 tok/s)** | **+57%** |
+| p10-p90 decode spread | 7.88-14.75 ms (1.87x) | 9.40-9.84 ms (**1.05x**) | variance collapsed |
+
+**Headline vs torch updated.** Speedygrad p50 decode 104.9 tok/s vs torch 35.4 tok/s = **2.96x at p50** (was 2.82x). Prefill 188ms vs torch 43ms = **4.4x slower** (was 16.4x slower). Torch still wins prefill, but the gap is now narrow enough that for any output >5-10 tokens speedygrad wins overall wall time.
+
+**The decode variance collapse is the more interesting finding.** iter 8's 1.87x p10-p90 spread on decode was attributed in the writeup to GPU clock-state churn (matching the iter 7.5 mechanism). iter 8.1 shows the actual mechanism was the non-JIT first call breaking cuGraph cadence: when every call is JIT'd cuGraph replay, the GPU stays at consistent utilization and per-token decode is rock-stable at 9.5±0.2ms. The clock-state confound was real but it was *triggered by* the missing JIT capture, not a fundamental small-op issue.
+
+**Bit-identical output preserved.** Same 25 generated tokens as torch and as iter 8's measurements. The Variable domain extension didn't break correctness.
+
+**First-call cost moved.** Cold prefill in run0 went from ~3s to ~13s. The JIT now captures a kernel for the start_pos=0 case on the first invocation; subsequent invocations are cached. Amortizes immediately — runs 1-4 prefill = 187 ± 3 ms.
+
+**Reasoning mode (iter 8.1).**
+
+| Claim | Mode | Confidence | Evidence |
+|---|---|---|---|
+| Prefill drops 3.75x by JIT-ing start_pos=0 | induction | 95% | direct A/B (705 → 188 ms), same model, same hardware, same prompt |
+| Decode p50 stays ~100 tok/s, variance collapses | induction | 95% | 120 samples, p10/p90 within 5% of p50 |
+| Decode variance was caused by non-JIT first-call cadence break, not GPU clock-state alone | abduction | 80% | iter 8's hypothesis was clock-state; this experiment shows variance falls 18x when JIT cadence is consistent. Could still be partially clock-state, but the dominant mechanism is JIT-cadence |
+| start_pos=0 JIT kernel is correct (KV cache populated incrementally including position 0) | deduction | 95% | bit-identical 25-token output to torch baseline; KV cache assignment `cache_kv[:,:,start_pos:start_pos+seqlen,:,:].assign(...)` works for any start_pos including 0 |
+| Cold compile cost increased (3s → 13s) | observation | 99% | direct measurement, run0 prefill |
+| Remaining prefill gap (4.4x slower than torch) is per-token forward latency, not host overhead | abduction | 60% | 5 ms/tok × 37 = 188 ms; per-token compute is ~80 cuGraph kernels × 30us each ≈ 2.4ms GPU + 2-3ms host. To close the gap to torch's 1.16 ms/tok would need batched seqlen>1 forward |
+
+
 
 **H₀.** Speedygrad's iter 6+7 host-floor wins compound on real LLM inference. Llama 3.2 1B-Instruct end-to-end decode on speedygrad beats torch + HF transformers eager on the same RTX 4080.
 

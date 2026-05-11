@@ -1,5 +1,5 @@
 from typing import cast, Callable
-import struct
+import struct, math
 from collections import defaultdict
 from tinygrad.codegen.opt import tc
 from tinygrad.uop.ops import Ops, UOp, PatternMatcher, UPat, GroupOp
@@ -11,7 +11,16 @@ from tinygrad.helpers import flatten, get_single_element, prod, unwrap, Target
 def render_val(x, dtype):
   if dtypes.is_float(dtype):
     if dtype == dtypes.double: return "0d%02X%02X%02X%02X%02X%02X%02X%02X" % tuple(struct.pack("d",x)[::-1])
-    if dtype == dtypes.half: return "0x%02X%02X" % tuple(struct.pack("e",x)[::-1])
+    if dtype == dtypes.half:
+      # Python's struct "e" format raises OverflowError on inf/nan AND on finite values
+      # outside fp16's representable range. Emit IEEE 754 literals directly for inf/nan;
+      # clamp finite overflow (e.g. tinygrad's -1e38 sentinel used as a stand-in for -inf
+      # in mask construction) to the fp16 min/max — same numerical effect for masking.
+      if math.isinf(x): return "0xFC00" if x < 0 else "0x7C00"
+      if math.isnan(x): return "0x7E00"
+      if x > 65504.0: return "0x7BFF"   # fp16 max finite
+      if x < -65504.0: return "0xFBFF"  # fp16 min finite
+      return "0x%02X%02X" % tuple(struct.pack("e",x)[::-1])
     return "0f%02X%02X%02X%02X" % tuple(struct.pack("f",x)[::-1])
   return str(int(x)) + ("U" if dtypes.is_unsigned(dtype) else "")
 

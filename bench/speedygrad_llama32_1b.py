@@ -64,7 +64,7 @@ def main():
     prefill_toks = toks[:-1]
     last_tok = toks[-1]
 
-    # Prefill
+    # Prefill (one token at a time so each call goes through the JIT path)
     GlobalCounters.reset()
     t0 = time.perf_counter()
     for tok in prefill_toks:
