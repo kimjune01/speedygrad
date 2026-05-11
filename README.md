@@ -21,24 +21,42 @@ Shapes: N=1024 for gemm/mul\_sum, 256 for gemm\_256/softmax/layernorm/permute, 4
 
 ## LLM inference (RTX 4080, p50 decode tok/s)
 
-| Model | quant | vanilla tinygrad | **speedygrad** | sg/vanilla | torch+HF (eager) | sg/torch |
-|---|---|---:|---:|---:|---:|---:|
-| Llama 3.2 1B (safetensors) | fp16 | 83 tok/s | **140 tok/s** | **1.68×** | 20 tok/s | **7.0×** |
-| Qwen 3 0.6B (GGUF) | Q8\_0 | 226 tok/s | **241 tok/s** | **1.07×** | 13 tok/s | **18.5×** |
-| Qwen 3 1.7B (GGUF) | Q4\_K\_M | 133 tok/s | **127 tok/s** | **0.95×**\* | 9 tok/s | **14.1×** |
-| Qwen 3 8B (GGUF) | Q4\_K\_M | 0.9 tok/s | **1.0 tok/s** | 1.1× | 7 tok/s | **0.14×**⚠️ |
+The legitimate question for a tinygrad user evaluating this fork: **does installing speedygrad over upstream tinygrad change anything on the same workload?**
 
-\* 1.7B speedygrad row is within measurement noise of vanilla; the new GGUF inference path (`tinygrad/llm/model.py`) is already efficient enough that speedygrad's monkeypatch optimizations have less room to help. The bigger wins on Llama 1B are on the older `examples/llama3.py:build_transformer` safetensors path.
+| Model | quant | path | vanilla tinygrad | **speedygrad** | speedygrad/vanilla |
+|---|---|---|---:|---:|---:|
+| Llama 3.2 1B | fp16 | safetensors via `examples/llama3.py` | 83 tok/s | **140 tok/s** | **1.68×** |
+| Qwen 3 0.6B | Q8\_0 | GGUF via `tinygrad/llm/model.py` | 226 tok/s | **241 tok/s** | **1.07×** |
+| Qwen 3 1.7B | Q4\_K\_M | GGUF | 133 tok/s | **127 tok/s** | **0.95×**\* |
+| Qwen 3 8B | Q4\_K\_M | GGUF | 0.9 tok/s | **1.0 tok/s** | 1.1× ⚠️ |
 
-⚠️ **Qwen 3 8B Q4\_K\_M is broken** at ~1 tok/s decode (we should be ≥50). Q4\_K\_M dequantization on tinygrad's CUDA path is bandwidth-pathological at 8B size — known issue, filed as frontier item. Use Q8\_0 or fp16 (when memory permits) for now.
+The speedygrad-vs-vanilla delta is path-dependent. On the older safetensors path, the monkeypatch optimizations (`counter.realize` + memoize-walk) deliver a real 1.68× win. On the newer GGUF path, the upstream `tinygrad/llm/model.py` is already efficient enough that speedygrad's contributions shrink to noise. Use this fork if you're on the older path or running a workload that exposes its specific bottlenecks; for stock GGUF inference, vanilla tinygrad is roughly equivalent.
 
-Reproduce:
+\* 1.7B is within measurement noise of vanilla.
+
+⚠️ **Qwen 3 8B Q4\_K\_M is broken** at ~1 tok/s decode (decode\_p50 = 1051 ms; theoretical bandwidth ceiling is ~7 ms). Q4\_K\_M dequantization on tinygrad's CUDA path has bandwidth-pathological access patterns at 8B+ model size. Filed as a frontier item in [`HYPOTHESIS_GRAPH.md`](HYPOTHESIS_GRAPH.md). Use Q8\_0 (when memory permits) for now; this is the workload most tinybox shoppers care about, and we lose to torch+HF here.
+
+### Context: where speedygrad sits in the inference landscape
+
+Comparison vs other inference stacks on Llama 3.2 1B fp16, same hardware:
+
+| Stack | decode tok/s | notes |
+|---|---:|---|
+| torch + HF transformers (eager mode) | 20 tok/s | the default path most users start with — no `torch.compile`, no SDPA |
+| **speedygrad** (this fork) | **140 tok/s** | tinygrad with monkeypatched fast paths |
+| llama.cpp (CUDA backend, fp16) | ~224 tok/s | hand-tuned CUDA + fused attention; 1.6× faster than speedygrad |
+
+Treat the torch+HF eager number as **a worst-case lower bound, not a real comparator**. Anyone running production inference on torch uses `torch.compile` + SDPA (probably 2-3× faster than eager) or moves to vLLM / ExLlamaV2 entirely. Likewise llama.cpp will beat speedygrad on workloads it has hand-tuned kernels for; that gap is documented and bounded in [`HYPOTHESIS_GRAPH.md`](HYPOTHESIS_GRAPH.md).
+
+If you're shopping for a tinybox with the question "will I have to fight the inference stack?" — speedygrad sits in the middle of the spectrum: faster than the easy torch path most people start with, slower than the hand-tuned C++ specialists, and shares all of tinygrad's hackability and multi-device generality.
+
+### Reproduce
 
 ```bash
 PYTHONPATH=. python bench/scaling_table.py --runs 3 --n-new 20
 ```
 
-The bench harness runs each (model × framework) combo as a subprocess for clean state. `SPEEDYGRAD_VANILLA=1` env var disables all monkeypatch optimizations on the same bench code, isolating the speedygrad fork's contribution from the underlying tinygrad framework's. torch+HF baseline uses `transformers.AutoModelForCausalLM` eager mode (no `torch.compile`, no SDPA hint) — the default path most users start with. Both produce identical greedy text (`temperature=0`).
+Bench harness runs each combo as a subprocess for clean JIT state. `SPEEDYGRAD_VANILLA=1` env var disables all monkeypatch optimizations on the same bench code, isolating the fork's contribution. Greedy decode (`temperature=0`) for deterministic output — both vanilla and speedygrad produce identical text.
 
 ## What changed
 
