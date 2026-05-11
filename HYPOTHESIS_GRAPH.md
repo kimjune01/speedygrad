@@ -1338,6 +1338,10 @@ $env:PYTHONPATH = "."
 
 **Implementation surface.** The fix lands in `monkeypatch.py` as a rebind of `tinygrad.tensor._apply_map_to_tensors`, in the same pattern as the existing `run_linear` and `CUDAGraph.__call__` rebinds. Editing `tinygrad/tensor.py` directly is not the path: the upstream-tinygrad function is general-purpose and correct for non-JIT use; the speedygrad-specific fast path conditionally short-circuits when the JIT replay invariants hold (e.g., `applied_map` keys are all freshly-realized BUFFER UOps with no other user-held tensor references). For hot loops, monkeypatching is the only viable approach — direct tinygrad edits force re-merging on every upstream sync and lose the clear speedygrad-specific marker.
 
+**Methodology guardrail (carry forward from iter 10).** When a per-token rate computed from a trace total looks suspicious, **split by phase before dividing**. Iter 10 falsified iter 9's "1 cuMemHostAlloc per decode token" by counting allocs separately for {model load, prefill, decode}: total/total had been 183/174 ≈ 1, but per-phase was {146, 1.0, 0.02} — a different headline. Same shape as iter 9's bug-hunt round 1 (cuCtxSync ≠ kernel sum) and iter 9's median-vs-mean note for bursty workloads: aggregate statistics over heterogeneous phases hide the mechanism. Phase keys for the llama bench are at minimum {load, prefill, steady-state-decode}; for KV-cache-dependent kernels, also {early-decode, late-decode}.
+
+**Adversarial review limits (carry forward).** Iter 9's gemini bug-hunt correctly flipped the GPU-parity claim (cuCtxSync apples-to-oranges) AND correctly flagged cuMemHostAlloc as a hot-loop signature worth investigating. But it then computed its OWN per-token attribution from the same un-phase-split trace total (180.5 ms / 174 fwds → "~1ms / token"), reproducing the exact methodological flaw it had just caught. Adversarial review catches qualitative direction errors but inherits the quantitative methodology of the artifact under review. Carry: when a reviewer endorses a number that came from the same total-divided-by-total computation it just criticized, re-derive from the raw counts before treating it as confirmed.
+
 ---
 
 **Open frontier (after iter 8):**
@@ -1347,7 +1351,7 @@ $env:PYTHONPATH = "."
 | 1 | matvec p90 catastrophic outlier | unknown | unchanged from iter 7 |
 | 2 | **online-softmax integration (path 1: synthetic PROGRAM)** | ~200 | **prototype validated iter 7.5, ready for focused implementation iteration** |
 | 3 | exp_2048 1.19x — host overhead, NOT transcendental quality | ~30 | bug-hunt round 5 retraction: tinygrad's PTX renderer (`ptx.py:20`) already maps `Ops.EXP2` to `ex2.approx`, the CUDA intrinsic. The "polynomial decomposition" hypothesis in iter 6/7 was false. Real cause is unknown; 4us gap likely host-side (one fewer Python frame than torch's eager dispatch) |
-| 4 | _prepare_jit_inputs (11.5us cumtime per call) | ~50 | unchanged from iter 7 |
+| 4 | ~~_prepare_jit_inputs (11.5us cumtime per call)~~ — **iter 10 reframe**: the cost is in `_apply_map_to_tensors` walking `all_tensors` (~168 topovisit/decode-token, ~1.5-2 ms raw). See iter 10c below. Original 11.5us number was iter 7's cProfile snapshot before model weights populated `all_tensors`; with Llama 3.2 1B loaded the per-call cost is ~700x larger | unknown | **iter 10c open**: monkeypatch.py rebind of `tinygrad.tensor._apply_map_to_tensors` with a JIT-replay fast path. Risk: tensor identity for user-held references after realize. Adversarial review before patch |
 | 5 | Attention fusion (builds on #2) | ~200 | unblocked once #2 lands |
 | 6 | First-compile cost (~5s for gemm_256 at depth 5) | ~30 | unchanged from iter 7 |
 | 7 | **Pack multiple warps per block in online-softmax kernel** | ~10 | bug-hunt round 3 finding: 32-thread blocks cap SM occupancy at 50% on sm_89 (24 blocks/SM hardware limit). Apply during framework integration |
