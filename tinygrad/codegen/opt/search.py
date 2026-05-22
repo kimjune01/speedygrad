@@ -1,6 +1,6 @@
 import math, time, traceback, signal
 from dataclasses import replace
-from tinygrad.uop.ops import sym_infer, AxisType, UOp
+from tinygrad.uop.ops import sym_infer, AxisType, UOp, KernelInfo
 from tinygrad.device import Device, Buffer
 from tinygrad.helpers import prod, DEBUG, getenv, Context, unwrap
 from tinygrad.codegen.opt import Opt, OptOps, KernelOptError
@@ -64,7 +64,12 @@ def _try_compile(x:tuple[int,Scheduler]) -> tuple[int, tuple[UOp, float]|None]:
   try:
     st = time.perf_counter()
     from tinygrad.codegen import to_program
-    prg = to_program(x[1].copy().get_optimized_ast(name_override="test"), x[1].ren)
+    ast = x[1].copy().get_optimized_ast(name_override="test")
+    # Zero beam on the AST arg to prevent recursive abduct_search inside to_program
+    if isinstance(ast.arg, KernelInfo) and ast.arg.beam > 0:
+      ast = ast.replace(arg=replace(ast.arg, beam=0))
+    with Context(SEARCH=0):
+      prg = to_program(ast, x[1].ren)
     et = time.perf_counter() - st
     uops = prg.src[2].src
     if len(uops) >= (uops_max:=getenv("BEAM_UOPS_MAX", 3000)) > 0:
